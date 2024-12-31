@@ -68,7 +68,7 @@ pub const Swapchain = struct {
         if (caps.max_image_count > 0) {
             image_count = @min(image_count, caps.max_image_count);
         }
-        slog.debug("Selected swapchain image count: {}", .{image_count});
+        slog.debug("selected swapchain image count: {}", .{image_count});
 
         // TODO: if main queue has no present
         // const qfi = [_]u32{ gc.graphics_queue.family, gc.present_queue.family };

@@ -18,15 +18,22 @@ const sdl_vk = @cImport({
     @cInclude("SDL3/SDL_vulkan.h");
 });
 
+var sleep_when_inactive = false; // stop rendering when there are no visual changes
+
 /// VSync
 const preferred_present_mode: []const vk.PresentModeKHR = &[_]vk.PresentModeKHR{
-    .mailbox_khr,
     .immediate_khr,
+    .mailbox_khr,
+    .fifo_relaxed_khr,
+    .fifo_khr,
 };
-/// max frames in flight app can support (in case its device asks for more)
-/// should be at least 2, as its unlikely any implementation will let us do no double buffering
-const max_frames_in_flight = 1;
+
+/// how many frames in flight we want
+/// NOTE: swapchain image count = prefered_frames_in_flight + 1 (because 1 is being presented and not worked on)
 const prefered_frames_in_flight = 1;
+/// just in rare case we don't get `prefered_frames_in_flight` as fallback
+/// max frames in flight app can support (in case device requires more than preferred)
+const max_frames_in_flight = 1;
 
 var gpa_instance = std.heap.GeneralPurposeAllocator(.{}){};
 const gpa = gpa_instance.allocator();
@@ -36,8 +43,8 @@ const show_demo = true;
 var show_dialog_outside_frame: bool = false;
 const vulkan = true;
 
-const init_w: f32 = 800;
-const init_h: f32 = 600;
+const init_w: f32 = 1024;
+const init_h: f32 = 720;
 
 pub fn main() !void {
     const alloc = gpa_instance.allocator();
@@ -48,7 +55,7 @@ pub fn main() !void {
     }
     slog.info("SDL version: {}", .{BaseBackend.getSDLVersion()});
 
-    dvui.Examples.show_demo_window = true;
+    dvui.Examples.show_demo_window = false;
 
     var sdl_win: *sdl.SDL_Window = undefined;
     {
@@ -96,6 +103,11 @@ pub fn main() !void {
     defer ctx.deinit();
     std.debug.assert(sdl_vk.SDL_Vulkan_GetPresentationSupport(@ptrFromInt(@intFromEnum(vk_instance.handle)), @ptrFromInt(@intFromEnum(ctx.pdev)), ctx.main_queue_idx));
 
+    {
+        const present_modes = try ctx.instance.getPhysicalDeviceSurfacePresentModesAllocKHR(ctx.pdev, ctx.surface, alloc);
+        defer alloc.free(present_modes);
+        for (present_modes) |p| slog.info("present modes available: {}", .{p});
+    }
     var swapchain = Swapchain.init(&ctx, alloc, .{
         .extent = vk.Extent2D{ .width = init_w, .height = init_h },
         .prefered_image_count = prefered_frames_in_flight + 1, // one is consumed by presentation engine displaying it
@@ -169,7 +181,7 @@ pub fn main() !void {
 
     const invalid_renderer: *sdl.SDL_Renderer = @ptrFromInt(0xFFFF_FFFF); // we will use vulkan renderer so sdl renderer will be unused - use dummy invalid pointer that should crash if accessed by accident
     var base_backend = BaseBackend.init(sdl_win, invalid_renderer);
-    defer base_backend.deinit();
+    errdefer base_backend.deinit();
     var dvui_vk_backend = try DvuiVkRenderer.init(alloc, &base_backend, .{
         .max_frames_in_flight = max_frames_in_flight,
         .vkGetDeviceProcAddr = ctx.instance.wrapper.dispatch.vkGetDeviceProcAddr,
@@ -181,6 +193,7 @@ pub fn main() !void {
         .mem_props = ctx.phy_devices.items(.mem_props)[ctx.selected_phy_device_idx],
     }); // init on top of already initialized backend, overrides rendering
     defer dvui_vk_backend.deinit(alloc);
+    defer base_backend.deinit(); // deinit base backend first, so that we can still handle textureDestroy etc.
 
     // init dvui Window (maps onto a single OS window)
     var win = try dvui.Window.init(@src(), gpa, dvui_vk_backend.backend(), .{});
@@ -213,7 +226,7 @@ pub fn main() !void {
         }
 
         //
-        // Rendering
+        // Vulkan rendering setup & draw triangle
         //
         var cmdbuf: vk.CommandBuffer = undefined;
         try ctx.dev.allocateCommandBuffers(&.{
@@ -272,20 +285,31 @@ pub fn main() !void {
         //
         // Render DVUI
         //
+        const stats = dvui_vk_backend.stats; // grab copy of stats
+        dvui_vk_backend.beginFrame(.{ .cmdbuf = cmdbuf, .queue = ctx.main_queue, .command_pool = pool });
         // beginWait coordinates with waitTime below to run frames only when needed
         const nstime = win.beginWait(base_backend.hasEvent());
-        dvui_vk_backend.renderPassStarted(cmdbuf, ctx.main_queue, pool);
         try win.begin(nstime);
+
+        clearTextureCaches(&win);
 
         const quit = try base_backend.addAllEvents(&win);
         if (quit) break :main_loop;
 
-        // cursor management
-        base_backend.setCursor(win.cursorRequested());
-        base_backend.textInputRect(win.textInputRequested());
-
         try gui_frame();
-        _ = win.end(.{}) catch |err| slog.warn("dvui draw end failed: {}", .{err});
+        try gui_stats(stats, dvui_vk_backend.host_vis_data.len);
+
+        const end_micros = try win.end(.{});
+
+        // cursor management
+        // if (win.cursorRequestedFloating()) |cursor| {
+        //     // cursor is over floating window, dvui sets it
+        //     base_backend.setCursor(cursor);
+        // } else {
+        //     // cursor should be handled by application
+        //     base_backend.setCursor(.bad);
+        // }
+        base_backend.textInputRect(win.textInputRequested());
 
         //
         // End render and present
@@ -297,49 +321,19 @@ pub fn main() !void {
             error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
             else => |narrow| return narrow,
         };
+
+        // waitTime and beginWait combine to achieve variable framerates
+        if (sleep_when_inactive) {
+            const wait_event_micros = win.waitTime(end_micros, null);
+            base_backend.waitEventTimeout(wait_event_micros);
+        }
+
+        // Example of how to show a dialog from another thread (outside of win.begin/win.end)
+        if (show_dialog_outside_frame) {
+            show_dialog_outside_frame = false;
+            try dvui.dialog(@src(), .{ .window = &win, .modal = false, .title = "Dialog from Outside", .message = "This is a non modal dialog that was created outside win.begin()/win.end(), usually from another thread." });
+        }
     }
-
-    // while (true) {
-    //     // beginWait coordinates with waitTime below to run frames only when needed
-    //     const nstime = win.beginWait(base_backend.hasEvent());
-
-    //     // marks the beginning of a frame for dvui, can call dvui functions after this
-    //     try win.begin(nstime);
-
-    //     // send all SDL events to dvui for processing
-    //     const quit = try base_backend.addAllEvents(&win);
-    //     if (quit) break;
-
-    //     // if dvui widgets might not cover the whole window, then need to clear
-    //     // the previous frame's render
-    //     // _ = BaseBackend.c.SDL_SetRenderDrawColor(base_backend.renderer, 55, 0, 0, 55);
-    //     // _ = BaseBackend.c.SDL_RenderClear(base_backend.renderer);
-
-    //     // The demos we pass in here show up under "Platform-specific demos"
-    //     try gui_frame();
-
-    //     // marks end of dvui frame, don't call dvui functions after this
-    //     // - sends all dvui stuff to backend for rendering, must be called before renderPresent()
-    //     const end_micros = try win.end(.{});
-    //     _ = end_micros; // autofix
-
-    //     // cursor management
-    //     base_backend.setCursor(win.cursorRequested());
-    //     base_backend.textInputRect(win.textInputRequested());
-
-    //     // render frame to OS
-    //     base_backend.renderPresent();
-
-    //     // waitTime and beginWait combine to achieve variable framerates
-    //     // const wait_event_micros = win.waitTime(end_micros, null);
-    //     // backend.waitEventTimeout(wait_event_micros);
-
-    //     // Example of how to show a dialog from another thread (outside of win.begin/win.end)
-    //     // if (show_dialog_outside_frame) {
-    //     //     show_dialog_outside_frame = false;
-    //     //     try dvui.dialog(@src(), .{ .window = &win, .modal = false, .title = "Dialog from Outside", .message = "This is a non modal dialog that was created outside win.begin()/win.end(), usually from another thread." });
-    //     // }
-    // }
 }
 
 // both dvui and SDL drawing
@@ -348,25 +342,45 @@ fn gui_frame() !void {
         var m = try dvui.menu(@src(), .horizontal, .{ .background = true, .expand = .horizontal });
         defer m.deinit();
 
-        if (try dvui.menuItemLabel(@src(), "File", .{ .submenu = true }, .{ .expand = .none })) |r| {
-            var fw = try dvui.floatingMenu(@src(), dvui.Rect.fromPoint(dvui.Point{ .x = r.x, .y = r.y + r.h }), .{});
-            defer fw.deinit();
+        _ = try dvui.checkbox(@src(), &dvui.Examples.show_demo_window, "show demo", .{ .gravity_x = 0.1 });
+        _ = try dvui.checkbox(@src(), &sleep_when_inactive, "sleep when inactive", .{ .gravity_x = 0.1 });
 
-            if (try dvui.menuItemLabel(@src(), "Close Menu", .{}, .{}) != null) {
-                m.close();
-            }
-        }
-
-        if (try dvui.menuItemLabel(@src(), "Edit", .{ .submenu = true }, .{ .expand = .none })) |r| {
-            var fw = try dvui.floatingMenu(@src(), dvui.Rect.fromPoint(dvui.Point{ .x = r.x, .y = r.y + r.h }), .{});
-            defer fw.deinit();
-            _ = try dvui.menuItemLabel(@src(), "Dummy", .{}, .{ .expand = .horizontal });
-            _ = try dvui.menuItemLabel(@src(), "Dummy Long", .{}, .{ .expand = .horizontal });
-            _ = try dvui.menuItemLabel(@src(), "Dummy Super Long", .{}, .{ .expand = .horizontal });
-        }
+        // var choice: usize = 0;
+        // _ = try dvui.dropdown(@src(), &.{ "immediate (no vsync)", "fifo", "mailbox" }, &choice, .{});
     }
     // look at demo() for examples of dvui widgets, shows in a floating window
     try dvui.Examples.demo();
+}
+
+fn gui_stats(stats: DvuiVkRenderer.Stats, preallocated_mem: usize) !void {
+    var m = try dvui.menu(@src(), .vertical, .{ .background = true, .expand = null, .gravity_x = 1.0, .min_size_content = .{ .w = 200, .h = 100 } });
+    defer m.deinit();
+    try dvui.label(@src(), "draw_calls: {}\nverts: {}\nindices: {}\ntextures: {}\ntexture mem: {:.1}\npreallocated gpu mem: {:.1}", .{
+        stats.draw_calls,
+        stats.verts,
+        stats.indices,
+        stats.textures_alive,
+        std.fmt.fmtIntSizeBin(stats.textures_mem),
+        std.fmt.fmtIntSizeBin(preallocated_mem),
+    }, .{});
+}
+
+fn clearTextureCaches(win: *dvui.Window) void {
+    const self = win;
+    _ = self; // autofix
+    // {
+    //     var removable: u32 = 0;
+    //     var it = self.texture_cache.iterator();
+    //     while (it.next()) |item| {
+    //         if (!item.value_ptr.used) {
+    //             //self.backend.textureDestroy(item.value_ptr.texture);
+    //             removable += 1;
+    //         }
+    //         break;
+    //     }
+    //     //self.texture_cache.clearRetainingCapacity();
+    //     slog.debug("removable {} / {}", .{ removable, self.texture_cache.count() });
+    // }
 }
 
 fn createRenderPass(gc: *VkContext, swapchain: Swapchain) !vk.RenderPass {

@@ -1,12 +1,22 @@
-//! Vulkan dvui renderer
-//! Is not a full backend, only implements rendering related backend functions.
-//! All non rendering functions get forwarded to base_backend (whatever backend is selected through build zig).
-//! Should work with any base backend as long as it doesn't break from not receiving some command or its not rendering in unexpected calls non rendering related calls.
+//! Experimental Vulkan dvui renderer
+//! Its not a full backend, only implements rendering related backend functions.
+//! All non rendering related functions get forwarded to base_backend (whatever backend is selected through build zig).
+//! Should work with any base backend as long as it doesn't break from not receiving some of the overridden callbacks or its not rendering from non rendering related calls.
+//! Tested only with sdl3 base backend.
 //!
-//! * Currently handles only rendering, initial vulkan setup, swapchain & present logic is expected to be implemented by app.
-//! * Renderer performs almost no synchronization outside where it must such as texture creation etc. It follows standart vulkan practice that no more than N (specified at init options) frames in flight will happen.
-//!   This synchronization must happen at application level (usually when handling swapchain & present).
-//!   If this is not enforced then in flight gpu frame data can get overwritten which can lead to undefined behaviour.
+//! Notes:
+//! * Currently app must provide vulkan setup, swapchain & present logic, etc.
+//! * Param `frames_in_flight`, very important:
+//!   Currently renderer itself performs almost no locking with gpu except when creating new textures. Synchronization  is archived by using frames in flight as sync:
+//!   It is assumed that swapchain has limited number of images (not too many) and at worst case CPU can issue only that many frames before it will have no new frames where render to. That is good blocking/sync point.
+//!   By using that knowledge we delay any host->gpu resource operations by max_frames_in_flight to be sure there won't be any data races. (for example textureDeletion is delayed to make sure gpu doesn't use it any more)
+//!   But at the moment swapchain management is left for application to do, so application must make sure this is enforced and pass in this information as `max_frames_in_flight` during int.
+//!   Otherwise gpu frame data can get overwritten while its still being used leading to undefined behaviour.
+//! * Memory: all space for vertex & index buffers is preallocated at start requiring setting appropriate limits in options. Requests to render over limit is safe but will lead to draw commands being dropped.
+//!   Texture bookkeeping is also preallocated. But images themselves are allocated individually at runtime. Currently 1 image = 1 allocation which is ok for large or few images,
+//!   but not great for many smaller images that can eat in max gpu allocation limit. TODO: implement hooks for general purpose allocator
+//!   TODO: currently there also seems to be texture leaks from dvui itself, especially when scaling content. Not all textures seem to be destroyed.
+//!
 const std = @import("std");
 const builtin = @import("builtin");
 const slog = std.log.scoped(.dvui_vulkan);
@@ -18,136 +28,178 @@ const vs_spv align(64) = @embedFile("dvui.vert.spv").*;
 const fs_spv align(64) = @embedFile("dvui.frag.spv").*;
 
 const Self = @This();
-pub const Vertex = dvui.Vertex;
 
 pub const apis: []const vk.ApiInfo = &(.{vk.features.version_1_0});
 pub const DeviceProxy = vk.DeviceProxy(apis);
+pub const Vertex = dvui.Vertex;
 pub const Indice = u16;
-pub const invalid_texture: *anyopaque = @ptrFromInt(0xBAD0); //@ptrFromInt(0xFFFF_FFFF);
+pub const invalid_texture: *anyopaque = @ptrFromInt(0xBAD0BAD0); //@ptrFromInt(0xFFFF_FFFF);
+
+// debug flags
 const enable_breakpoints = false;
-// todo: query min_alignment?
-// https://vulkan.gpuinfo.org/displaydevicelimit.php?name=minMemoryMapAlignment&platform=all
-const vk_alignment = if (builtin.target.os.tag.isDarwin()) 16384 else 4096;
+const texture_tracing = false; // tace leaks and usage
 
 /// initialization options, caller still owns all passed in resources
 pub const InitOptions = struct {
-    /// vulkan loader entry point for geting Vulkan functions
-    /// we are trying to keep this file independant from user code so we can't share api config (unless we make this whole file generic)
+    /// vulkan loader entry point for getting Vulkan functions
+    /// we are trying to keep this file independent from user code so we can't share api config (unless we make this whole file generic)
     vkGetDeviceProcAddr: vk.PfnGetDeviceProcAddr,
 
     /// vulkan device
     dev: vk.Device,
     /// vulkan render pass
     render_pass: vk.RenderPass,
-    /// queue - used only for texture upload
+    /// queue - used only for texture upload,
+    /// used here only once during initialization, afterwards texture upload queue must be provided with beginFrame()
     queue: vk.Queue,
     /// command pool - used only for texuture upload
     comamnd_pool: vk.CommandPool,
     /// vulkan physical device
     pdev: vk.PhysicalDevice,
+    /// physical device memory properties
     mem_props: vk.PhysicalDeviceMemoryProperties,
     /// optional vulkan host side allocator
     vk_alloc: ?*vk.AllocationCallbacks = null,
 
-    // /// descriptor pool - must have VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
-    // dpool: vk.DescriptorPool,
-    //image_count: u32 = 3,
-    // msaa_samples: u32 = 0,
-
-    /// How many dvui frames can be in flight
-    /// Should be swapchain image count or larger (if more than one begin/end pair is called per app frame)
-    /// Otherwise its possible that previous submitted frame data which is still in flight will get overwritten
+    /// How many frames can be in flight in worst case
+    /// In simple single window configuration where synchronization happens when presenting should be at least (swapchain image count - 1) or larger.
     max_frames_in_flight: u32,
-    // /// Maximum number of indices  that can be submitted in dvui frame (begin/end).
-    // /// if any more indices are submitted than they will be ignored and warning will logged
-    // /// TODO: figure out if dvui has similar constant, otherwise implement dynamic buffer growth
-    // max_indices: u32 = 0xFFFF,
-    // max_vertices: u32 = 0xFFFF,
 
-    /// Maximum number of created textures supported (across all overlapping frames)
-    max_textures: u32 = 512,
+    /// Maximum number of indices that can be submitted in single frame
+    /// Draw requests above this limit will get discarded
+    max_indices_per_frame: u32 = 1024 * 128,
+    max_vertices_per_frame: u32 = 1024 * 64,
 
-    /// per frame limits
-    max_inflight_buffers: u32 = 1024 * 8,
+    /// Maximum number of alive textures supported. global (across all overlapping frames)
+    /// Note: as this is only book keeping limit it can be set quite high. Real texture memory usage could be more concernig, as well as large allocation count.
+    max_textures: u16 = 256,
 
-    /// bytes - total host visible memory allocated
-    /// used for passing vertex & index buffers to gpu
-    /// this size should be large enough to store all in flight drawClippedTriangles() buffers
-    host_visible_memory_size: u32 = maxHostVisibleSize(3, 1024 * 32, 1024 * 32),
-    pub inline fn maxHostVisibleSize(max_frames_in_flight: u32, max_vertices_per_frame: u32, max_indices_per_frame: u32) u32 {
-        return max_frames_in_flight * (max_vertices_per_frame * @sizeOf(dvui.Vertex) + max_indices_per_frame * @sizeOf(Indice));
+    /// error and invalid texture handle color
+    /// if by any chance renderer runs out of textures or due to other reason fails to create a texture then this color will be used as texture
+    error_texture_color: [4]u8 = [4]u8{ 255, 0, 255, 255 }, // default bright pink so its noticeable for debug, can be set to alpha 0 for invisible etc.
+
+    /// if uv coords go out of bounds, how should the sampling behave
+    texture_wrap: vk.SamplerAddressMode = .repeat,
+
+    /// bytes - total host visible memory allocated ahead of time
+    pub inline fn hostVisibleMemSize(s: @This()) u32 {
+        const vtx_space = std.mem.alignForward(u32, s.max_vertices_per_frame * @sizeOf(dvui.Vertex), vk_alignment);
+        const idx_space = std.mem.alignForward(u32, s.max_indices_per_frame * @sizeOf(Indice), vk_alignment);
+        return s.max_frames_in_flight * (vtx_space + idx_space);
     }
-
-    // device (gpu) memory allocation strategy
-    // used for created images,
-
-    //device_memory_page_size : u32,
 };
 
+/// TODO:
 /// allocation strategy for device (gpu) memory
-const ImageAllocStrategy = union(enum) {
-    /// user provides proper allocator
-    allocator: struct {},
-    /// most basic implementation, ok for few images created with backend.createTexture
-    /// WARNING: can consume much of or hit vk.maxMemoryAllocationCount limit too many resources are used, see:
-    /// https://vulkan.gpuinfo.org/displaydevicelimit.php?name=maxMemoryAllocationCount&platform=all
-    allocate_each: void,
-};
-
-const Stats = struct {
-    // per frame
-    draw_calls: u32 = 0,
-};
-
-pub const tex_binding = 1; // shader binding slot must match shader
-// pub const ubo_binding = 0; // uniform binding slot must match shader
-// const Uniform = extern struct {
-//     viewport_size: @Vector(2, f32),
+// const ImageAllocStrategy = union(enum) {
+//     /// user provides proper allocator
+//     allocator: struct {},
+//     /// most basic implementation, ok for few images created with backend.createTexture
+//     /// WARNING: can consume much of or hit vk.maxMemoryAllocationCount limit too many resources are used, see:
+//     /// https://vulkan.gpuinfo.org/displaydevicelimit.php?name=maxMemoryAllocationCount&platform=all
+//     allocate_each: void,
 // };
 
-// we need stable pointer to this, but its not worth alocating it, so make it global
+/// just simple debug and informative metrics
+pub const Stats = struct {
+    // per frame
+    draw_calls: u16 = 0,
+    verts: u32 = 0,
+    indices: u32 = 0,
+    // global
+    textures_alive: u16 = 0,
+    textures_mem: usize = 0,
+};
+
+// we need stable pointer to this, but its not worth allocating it, so make it global
 var g_dev_wrapper: vk.DeviceWrapper(apis) = undefined;
 
 base_backend: *dvui.backend,
 
-// host owned members
+// not owned by us:
 dev: DeviceProxy,
 pdev: vk.PhysicalDevice,
 vk_alloc: ?*vk.AllocationCallbacks,
 cmdbuf: vk.CommandBuffer = .null_handle,
+dpool: vk.DescriptorPool,
 gfx_queue: vk.Queue = .null_handle,
 cpool: vk.CommandPool = .null_handle,
-dpool: vk.DescriptorPool,
+// gfx_queue & cpool locking
+lock_userdata: ?*anyopaque = null, // user defined data that will be returned in callbacks
+lockCB: ?*const fn (userdata: ?*anyopaque) void = null,
+unlockCB: ?*const fn (userdata: ?*anyopaque) void = null,
 
 // owned by us
 samplers: [2]vk.Sampler,
+frames: []FrameData,
 textures: []Texture,
-dset_layout: vk.DescriptorSetLayout,
+destroy_textures_offset: u16 = 0,
+destroy_textures: []u16,
 pipeline: vk.Pipeline,
 pipeline_layout: vk.PipelineLayout,
+dset_layout: vk.DescriptorSetLayout,
 render_target: ?*Texture = null,
+current_frame: *FrameData, // points somewhere in frames
+
+win_extent: vk.Extent2D = undefined,
+dummy_texture: Texture = undefined, // dummy/null white texture
+error_texture: Texture = undefined,
 
 host_vis_mem_idx: u32,
 host_vis_mem: vk.DeviceMemory,
 host_vis_coherent: bool,
-host_vis_data: []u8,
-host_vis_offset: usize = 0, // linearly advaces and wraps to 0 - assumes size is large enough to not overwrite old still in flight data
+host_vis_data: []u8, // mapped host_vis_mem
+//host_vis_offset: usize = 0, // linearly advaces and wraps to 0 - assumes size is large enough to not overwrite old still in flight data
 device_local_mem_idx: u32,
 
-inflight_buffers: []vk.Buffer,
-inflight_buffer_offset: usize = 0, // linearly advaces and wraps to 0 - assumes size is large enough to not overwrite old still in flight data
-
-win_extent: vk.Extent2D = undefined,
-prev_scissor: vk.Rect2D = undefined,
-dummy_texture: Texture = undefined,
+vtx_overflow_logged: bool = false,
+idx_overflow_logged: bool = false,
+stats: Stats = .{}, // just for info / dbg
 
 const FrameData = struct {
-    vtx_buff: vk.Buffer,
-    vtx_mem: []u8,
-    idx_buff: vk.Buffer,
-    idx_mem: []u8,
+    // buffers to host_vis memory
+    vtx_buff: vk.Buffer = .null_handle,
+    vtx_data: []u8 = &.{},
+    vtx_offset: u32 = 0,
+    idx_buff: vk.Buffer = .null_handle,
+    idx_data: []u8 = &.{},
+    idx_offset: u32 = 0,
     /// textures to be destroyed after frames cycle through
-    destroy_textures: []*Texture,
+    /// offset & len points to backend.destroy_textures[]
+    destroy_textures_offset: u16 = 0,
+    destroy_textures_len: u16 = 0,
+
+    fn deinit(f: *@This(), b: *Backend) void {
+        f.freeTextures(b);
+        b.dev.destroyBuffer(f.vtx_buff, b.vk_alloc);
+        b.dev.destroyBuffer(f.idx_buff, b.vk_alloc);
+    }
+
+    fn reset(f: *@This(), b: *Backend) void {
+        f.vtx_offset = 0;
+        f.idx_offset = 0;
+        f.destroy_textures_offset = b.destroy_textures_offset;
+        f.destroy_textures_len = 0;
+    }
+
+    fn freeTextures(f: *@This(), b: *Backend) void {
+        // free textures
+        for (f.destroy_textures_offset..(f.destroy_textures_offset + f.destroy_textures_len)) |i| {
+            const tidx = b.destroy_textures[i % b.destroy_textures.len]; // wrap around on overflow
+            // just for debug and monitoring
+            b.stats.textures_alive -= 1;
+            b.stats.textures_mem -= b.dev.getImageMemoryRequirements(b.textures[tidx].img).size;
+
+            //slog.debug("destroy texture {}({x}) | {}", .{ tidx, @intFromPtr(&b.textures[tidx]), b.stats.textures_alive });
+            b.textures[tidx].deinit(b);
+            b.textures[tidx].img = .null_handle;
+            b.textures[tidx].dset = .null_handle;
+            b.textures[tidx].img_view = .null_handle;
+            b.textures[tidx].mem = .null_handle;
+            b.textures[tidx].trace.addAddr(@returnAddress(), "destroy"); // keep tracing
+        }
+        f.destroy_textures_len = 0;
+    }
 };
 
 pub fn init(alloc: std.mem.Allocator, base_backend: *dvui.backend, opt: InitOptions) !Self {
@@ -156,6 +208,7 @@ pub fn init(alloc: std.mem.Allocator, base_backend: *dvui.backend, opt: InitOpti
     var dev = vk.DeviceProxy(apis).init(dev_handle, &g_dev_wrapper);
 
     // Memory
+    // host visible
     var host_coherent: bool = false;
     const host_vis_mem_type_index: u32 = blk: {
         // device local, host visible
@@ -175,11 +228,14 @@ pub fn init(alloc: std.mem.Allocator, base_backend: *dvui.backend, opt: InitOpti
             };
         return error.NoSuitableMemoryType;
     };
+    slog.debug("host_vis allocation size: {}", .{std.fmt.fmtIntSizeBin(opt.hostVisibleMemSize())});
     const host_visible_mem = try dev.allocateMemory(&.{
-        .allocation_size = opt.host_visible_memory_size,
+        .allocation_size = opt.hostVisibleMemSize(),
         .memory_type_index = host_vis_mem_type_index,
     }, opt.vk_alloc);
     errdefer dev.freeMemory(host_visible_mem, opt.vk_alloc);
+    const host_vis_data = @as([*]u8, @ptrCast((try dev.mapMemory(host_visible_mem, 0, vk.WHOLE_SIZE, .{})).?))[0..opt.hostVisibleMemSize()];
+    // device local mem
     const device_local_mem_idx: u32 = blk: {
         for (opt.mem_props.memory_types[0..opt.mem_props.memory_type_count], 0..) |mem_type, i|
             if (mem_type.property_flags.device_local_bit and !mem_type.property_flags.host_visible_bit) {
@@ -188,18 +244,57 @@ pub fn init(alloc: std.mem.Allocator, base_backend: *dvui.backend, opt: InitOpti
             };
         break :blk host_vis_mem_type_index;
     };
+    // Memory sub-allocation into FrameData
+    const frames = try alloc.alloc(FrameData, opt.max_frames_in_flight);
+    errdefer alloc.free(frames);
+    {
+        var mem_offset: usize = 0;
+        for (frames) |*f| {
+            f.* = .{};
+            // TODO: on error here cleanup will leak previous initialized frames
+            { // vertex buf
+                const buf = try dev.createBuffer(&.{
+                    .size = @sizeOf(Vertex) * opt.max_vertices_per_frame,
+                    .usage = .{ .vertex_buffer_bit = true },
+                    .sharing_mode = .exclusive,
+                }, opt.vk_alloc);
+                errdefer dev.destroyBuffer(buf, opt.vk_alloc);
+                const mreq = dev.getBufferMemoryRequirements(buf);
+                mem_offset = std.mem.alignForward(usize, mem_offset, mreq.alignment);
+                try dev.bindBufferMemory(buf, host_visible_mem, mem_offset);
+                f.vtx_data = host_vis_data[mem_offset..][0..mreq.size];
+                f.vtx_buff = buf;
+                mem_offset += mreq.size;
+            }
+            { // index buf
+                const buf = try dev.createBuffer(&.{
+                    .size = @sizeOf(Indice) * opt.max_indices_per_frame,
+                    .usage = .{ .index_buffer_bit = true },
+                    .sharing_mode = .exclusive,
+                }, opt.vk_alloc);
+                errdefer dev.destroyBuffer(buf, opt.vk_alloc);
+                const mreq = dev.getBufferMemoryRequirements(buf);
+                mem_offset = std.mem.alignForward(usize, mem_offset, mreq.alignment);
+                try dev.bindBufferMemory(buf, host_visible_mem, mem_offset);
+                f.idx_data = host_vis_data[mem_offset..][0..mreq.size];
+                f.idx_buff = buf;
+                mem_offset += mreq.size;
+            }
+        }
+    }
 
+    // Descriptors
+    const extra: u32 = 8; // idk, exact pool sizes returns OutOfPoolMemory slightly too soon, add extra margin
     const dpool_sizes = [_]vk.DescriptorPoolSize{
-        .{ .type = .combined_image_sampler, .descriptor_count = opt.max_textures },
-        .{ .type = .uniform_buffer, .descriptor_count = opt.max_frames_in_flight },
+        .{ .type = .combined_image_sampler, .descriptor_count = opt.max_textures + extra },
+        //.{ .type = .uniform_buffer, .descriptor_count = opt.max_frames_in_flight },
     };
     const dpool = try dev.createDescriptorPool(&.{
-        .max_sets = opt.max_textures + opt.max_frames_in_flight,
+        .max_sets = opt.max_textures + extra,
         .pool_size_count = dpool_sizes.len,
         .p_pool_sizes = &dpool_sizes,
         .flags = .{ .free_descriptor_set_bit = true },
     }, opt.vk_alloc);
-
     const dsl = try dev.createDescriptorSetLayout(
         &vk.DescriptorSetLayoutCreateInfo{
             .binding_count = 1,
@@ -232,21 +327,16 @@ pub fn init(alloc: std.mem.Allocator, base_backend: *dvui.backend, opt: InitOpti
             .size = @sizeOf(f32) * 4,
         }},
     }, opt.vk_alloc);
-
     const pipeline = try createPipeline(&dev, pipeline_layout, opt.render_pass, opt.vk_alloc);
-
-    const inflight_buffers = try alloc.alloc(vk.Buffer, opt.max_inflight_buffers);
-    errdefer alloc.free(inflight_buffers);
-    for (inflight_buffers) |*b| b.* = vk.Buffer.null_handle;
 
     const samplers = [_]vk.SamplerCreateInfo{
         .{ // dvui.TextureInterpolation.nearest
             .mag_filter = .nearest,
             .min_filter = .nearest,
             .mipmap_mode = .nearest,
-            .address_mode_u = .repeat,
-            .address_mode_v = .repeat,
-            .address_mode_w = .repeat,
+            .address_mode_u = opt.texture_wrap,
+            .address_mode_v = opt.texture_wrap,
+            .address_mode_w = opt.texture_wrap,
             .mip_lod_bias = 0,
             .anisotropy_enable = 0,
             .max_anisotropy = 0,
@@ -261,9 +351,9 @@ pub fn init(alloc: std.mem.Allocator, base_backend: *dvui.backend, opt: InitOpti
             .mag_filter = .linear,
             .min_filter = .linear,
             .mipmap_mode = .linear,
-            .address_mode_u = .repeat,
-            .address_mode_v = .repeat,
-            .address_mode_w = .repeat,
+            .address_mode_u = opt.texture_wrap,
+            .address_mode_v = opt.texture_wrap,
+            .address_mode_w = opt.texture_wrap,
             .mip_lod_bias = 0,
             .anisotropy_enable = 0,
             .max_anisotropy = 0,
@@ -290,36 +380,43 @@ pub fn init(alloc: std.mem.Allocator, base_backend: *dvui.backend, opt: InitOpti
             try dev.createSampler(&samplers[1], opt.vk_alloc),
         },
         .textures = try alloc.alloc(Texture, opt.max_textures),
+        .destroy_textures = try alloc.alloc(u16, opt.max_textures),
         .pipeline = pipeline,
         .pipeline_layout = pipeline_layout,
         .host_vis_mem_idx = host_vis_mem_type_index,
         .host_vis_mem = host_visible_mem,
-        .host_vis_data = @as([*]u8, @ptrCast((try dev.mapMemory(host_visible_mem, 0, vk.WHOLE_SIZE, .{})).?))[0..opt.host_visible_memory_size],
+        .host_vis_data = host_vis_data,
         .host_vis_coherent = host_coherent,
         .device_local_mem_idx = device_local_mem_idx,
-        .inflight_buffers = inflight_buffers,
         .gfx_queue = opt.queue,
         .cpool = opt.comamnd_pool,
+        .frames = frames,
+        .current_frame = &frames[0],
     };
     @memset(res.textures, Texture{});
-    {
-        const pixels = [4]u8{ 255, 255, 255, 255 };
-        res.dummy_texture = try res.createAndUplaodTexture(pixels[0..].ptr, 1, 1, .nearest);
-    }
+    res.dummy_texture = try res.createAndUplaodTexture(&[4]u8{ 255, 255, 255, 255 }, 1, 1, .nearest);
+    res.error_texture = try res.createAndUplaodTexture(&opt.error_texture_color, 1, 1, .nearest);
     return res;
 }
 
-/// to be safe, call queueWaitIdle before destruction
+/// for sync safety, better call queueWaitIdle before destruction
 pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
-    self.dev.destroyDescriptorSetLayout(self.dset_layout, self.vk_alloc);
-    for (self.inflight_buffers) |b| if (b != .null_handle) self.dev.destroyBuffer(b, self.vk_alloc);
-    alloc.free(self.inflight_buffers);
-    self.dummy_texture.deinit(self);
-    for (self.samplers) |s| self.dev.destroySampler(s, self.vk_alloc);
-    self.dev.destroyDescriptorPool(self.dpool, self.vk_alloc);
-    for (self.textures) |tex| if (!tex.isNull()) tex.deinit(self);
+    for (self.frames) |*f| f.deinit(self);
+    alloc.free(self.frames);
+    for (self.textures, 0..) |tex, i| if (!tex.isNull()) {
+        slog.debug("TEXTURE LEAKED {}:\n", .{i});
+        tex.trace.dump();
+        tex.deinit(self);
+    };
     alloc.free(self.textures);
+    alloc.free(self.destroy_textures);
 
+    self.dummy_texture.deinit(self);
+    self.error_texture.deinit(self);
+    for (self.samplers) |s| self.dev.destroySampler(s, self.vk_alloc);
+
+    self.dev.destroyDescriptorPool(self.dpool, self.vk_alloc);
+    self.dev.destroyDescriptorSetLayout(self.dset_layout, self.vk_alloc);
     self.dev.destroyPipelineLayout(self.pipeline_layout, self.vk_alloc);
     self.dev.destroyPipeline(self.pipeline, self.vk_alloc);
     self.dev.unmapMemory(self.host_vis_mem);
@@ -330,18 +427,47 @@ pub fn backend(self: *Self) dvui.Backend {
     return dvui.Backend.initWithCustomContext(Self, self, Self);
 }
 
-/// Call this command before rendering dvui in each new render-pass to set vulkan resources used for rendering
-///  all rendering commands will be in given cmdbuf
-///  gfx_queue & cpool is only used for immediate comamnds that need separate queue such as image transfers
-pub fn renderPassStarted(self: *Self, cmdbuf: vk.CommandBuffer, gfx_queue: vk.Queue, cpool: vk.CommandPool) void {
-    self.cmdbuf = cmdbuf;
-    self.gfx_queue = gfx_queue;
-    self.cpool = cpool;
+pub const FrameResources = struct {
+    cmdbuf: vk.CommandBuffer,
+    // queue & cmdpool used for texture creation & transfers
+    // if these resources are used from multiple threads lock/unlock callbacks can be set which will be called
+    command_pool: vk.CommandPool,
+    queue: vk.Queue,
+    lock_userdata: ?*anyopaque = null, // user defined data that will be returned in callbacks
+    lockCB: ?*const fn (userdata: ?*anyopaque) void = null,
+    unlockCB: ?*const fn (userdata: ?*anyopaque) void = null,
+};
+
+/// Begins new frame (frame that counts in overlaping / frames-in-flight), provides renderer with its needed data.
+///  All rendering commands will be in given cmdbuf. CmdBuf must be in a RenderPass.
+///  gfx_queue & cpool is only used for immediate comamnds such as image transfers that need separate cmdbufs
+pub fn beginFrame(self: *Self, frame_resources: FrameResources) void {
+    // init resources
+    self.cmdbuf = frame_resources.cmdbuf;
+    self.gfx_queue = frame_resources.queue;
+    self.cpool = frame_resources.command_pool;
+    self.lock_userdata = frame_resources.lock_userdata;
+    self.lockCB = frame_resources.lockCB;
+    self.unlockCB = frame_resources.unlockCB;
+
+    // advance frame pointer,
+    const current_frame_idx = (@intFromPtr(self.current_frame) - @intFromPtr(self.frames.ptr) + @sizeOf(FrameData)) / @sizeOf(FrameData) % self.frames.len;
+    const cf = &self.frames[current_frame_idx];
+    self.current_frame = cf;
+    cf.freeTextures(self);
+
+    // reset frame data
+    self.current_frame.reset(self);
+    self.stats.draw_calls = 0;
+    self.stats.indices = 0;
+    self.stats.verts = 0;
+    self.vtx_overflow_logged = false;
+    self.idx_overflow_logged = false;
 }
 
 /// call this after render pass has ended
 /// used to finish submitting textures
-pub fn renderPassEnded() void {}
+// pub fn endFrame() void {}
 
 //
 // Backend interface function overrides
@@ -358,10 +484,11 @@ pub fn sleep(self: *Backend, ns: u64) void {
 
 //pub const begin = Override.begin;
 pub fn begin(self: *Self, arena: std.mem.Allocator) void {
-    _ = arena; // autofix
     self.render_target = null;
     if (self.cmdbuf == .null_handle) @panic("dvui_vulkan_renderer: Command bufer not set before rendering started!");
-    //self.base_backend.begin(arena); // call base
+    // TODO: get rid of this or do it more cleanly
+    // very risky as sdl_backend calls renderer, but have no other way to pass through arena
+    self.base_backend.begin(arena); // call base
 
     //std.log.warn("DvuiVKRendderBegin...", .{});
     // self.base_backend.begin(arena);
@@ -384,13 +511,6 @@ pub fn begin(self: *Self, arena: std.mem.Allocator) void {
         .max_depth = 1,
     };
     dev.cmdSetViewport(cmdbuf, 0, 1, @ptrCast(&viewport));
-
-    const scissor = vk.Rect2D{
-        .offset = .{ .x = 0, .y = 0 },
-        .extent = extent,
-    };
-    self.prev_scissor = scissor;
-    dev.cmdSetScissor(cmdbuf, 0, 1, @ptrCast(&scissor));
 
     const PushConstants = struct {
         view_scale: @Vector(2, f32),
@@ -420,7 +540,22 @@ pub fn drawClippedTriangles(self: *Backend, texture: ?*anyopaque, vtx: []const V
     if (self.render_target != null) return; // TODO: render to textures
     const dev = self.dev;
     const cmdbuf = self.cmdbuf;
-    // slog.info("RENDER: {}, {}, {}", .{ vtx.len, idx.len, self.host_vis_offset });
+    const cf = self.current_frame;
+    const vtx_bytes = vtx.len * @sizeOf(Vertex);
+    const idx_bytes = idx.len * @sizeOf(Indice);
+    if (cf.vtx_data[cf.vtx_offset..].len < vtx_bytes) {
+        if (!self.vtx_overflow_logged) slog.warn("vertex buffer out of space", .{});
+        self.vtx_overflow_logged = true;
+        if (enable_breakpoints) @breakpoint();
+        return;
+    }
+    if (cf.idx_data[cf.idx_offset..].len < idx_bytes) {
+        // if only index buffer alone is out of bounds, we could just shrinking it... but meh
+        if (!self.idx_overflow_logged) slog.warn("index buffer out of space", .{});
+        self.idx_overflow_logged = true;
+        if (enable_breakpoints) @breakpoint();
+        return;
+    }
 
     { // clip / scissor
         const scissor = if (clipr) |c| vk.Rect2D{
@@ -430,88 +565,39 @@ pub fn drawClippedTriangles(self: *Backend, texture: ?*anyopaque, vtx: []const V
             .offset = .{ .x = 0, .y = 0 },
             .extent = self.win_extent,
         };
-        if (!std.meta.eql(self.prev_scissor, scissor)) {
-            self.prev_scissor = scissor;
-            dev.cmdSetScissor(cmdbuf, 0, 1, @ptrCast(&scissor));
-        }
+        dev.cmdSetScissor(cmdbuf, 0, 1, @ptrCast(&scissor));
     }
 
-    var idx_buff: vk.Buffer = undefined;
-    var vtx_buff: vk.Buffer = undefined;
-    { // upload vertices & indices
+    const idx_offset: u32 = cf.idx_offset;
+    const vtx_offset: u32 = cf.vtx_offset;
+    { // upload indices & vertices
         var modified_ranges: [2]vk.MappedMemoryRange = undefined;
-        var mem_offset = self.host_vis_offset;
         { // indices
-            const size = @sizeOf(Indice) * idx.len;
-            const buf = dev.createBuffer(&.{
-                .size = @sizeOf(Vertex) * idx.len,
-                .usage = .{ .index_buffer_bit = true },
-                .sharing_mode = .exclusive,
-            }, self.vk_alloc) catch |err| {
-                slog.err("createBuffer: {}", .{err});
-                return;
-            };
-            const mreq = dev.getBufferMemoryRequirements(buf);
-
-            mem_offset = std.mem.alignForward(usize, mem_offset, mreq.alignment);
-            if (size > mreq.size) slog.debug("buffer size req larger: {} {}", .{ size, mreq.size });
-            if (mem_offset + mreq.size > self.host_vis_data.len) mem_offset = 0;
-            dev.bindBufferMemory(buf, self.host_vis_mem, mem_offset) catch |err| {
-                slog.err("bindBufferMemory: {}", .{err});
-                dev.destroyBuffer(buf, self.vk_alloc);
-                return;
-            };
-            @memcpy(self.host_vis_data[mem_offset..][0..size], std.mem.sliceAsBytes(idx));
-            modified_ranges[0] = .{ .memory = self.host_vis_mem, .offset = mem_offset, .size = size };
-            mem_offset += size;
-            idx_buff = buf;
+            const dst = cf.idx_data[cf.idx_offset..][0..idx_bytes];
+            cf.idx_offset += @intCast(dst.len);
+            modified_ranges[0] = .{ .memory = self.host_vis_mem, .offset = @intFromPtr(dst.ptr) - @intFromPtr(self.host_vis_data.ptr), .size = dst.len };
+            @memcpy(dst, std.mem.sliceAsBytes(idx));
         }
         { // vertices
-            const size = @sizeOf(Vertex) * vtx.len;
-            const buf = dev.createBuffer(&.{
-                .size = size,
-                .usage = .{ .vertex_buffer_bit = true },
-                .sharing_mode = .exclusive,
-            }, self.vk_alloc) catch |err| {
-                slog.err("createBuffer: {}", .{err});
-                return;
-            };
-            const mreq = dev.getBufferMemoryRequirements(buf);
-
-            mem_offset = std.mem.alignForward(usize, mem_offset, mreq.alignment);
-            if (size > mreq.size) slog.debug("buffer size req larger: {} {}", .{ size, mreq.size });
-            if (mem_offset + mreq.size > self.host_vis_data.len) mem_offset = 0;
-            dev.bindBufferMemory(buf, self.host_vis_mem, mem_offset) catch |err| {
-                slog.err("bindBufferMemory: {}", .{err});
-                dev.destroyBuffer(buf, self.vk_alloc);
-                return;
-            };
-            @memcpy(self.host_vis_data[mem_offset..][0..size], std.mem.sliceAsBytes(vtx));
-            modified_ranges[1] = .{ .memory = self.host_vis_mem, .offset = mem_offset, .size = size };
-            mem_offset += size;
-            vtx_buff = buf;
+            const dst = cf.vtx_data[cf.vtx_offset..][0..vtx_bytes];
+            cf.vtx_offset += @intCast(dst.len);
+            modified_ranges[1] = .{ .memory = self.host_vis_mem, .offset = @intFromPtr(dst.ptr) - @intFromPtr(self.host_vis_data.ptr), .size = dst.len };
+            @memcpy(dst, std.mem.sliceAsBytes(vtx));
         }
-        self.host_vis_offset = mem_offset;
         if (!self.host_vis_coherent)
             dev.flushMappedMemoryRanges(modified_ranges.len, &modified_ranges) catch |err|
                 slog.err("flushMappedMemoryRanges: {}", .{err});
     }
-    // store for destruction
-    if (self.inflight_buffer_offset + 2 > self.inflight_buffers.len) self.inflight_buffer_offset = 0;
-    for (0..2) |i| if (self.inflight_buffers[self.inflight_buffer_offset + i] != .null_handle) dev.destroyBuffer(self.inflight_buffers[self.inflight_buffer_offset + i], self.vk_alloc);
-    self.inflight_buffers[self.inflight_buffer_offset] = idx_buff;
-    self.inflight_buffers[self.inflight_buffer_offset + 1] = vtx_buff;
-    self.inflight_buffer_offset += 2;
 
     if (@sizeOf(Indice) != 2) unreachable;
-    dev.cmdBindIndexBuffer(cmdbuf, idx_buff, 0, .uint16);
-    const offset = [_]vk.DeviceSize{0};
-    dev.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast(&vtx_buff), &offset);
-    var dset: vk.DescriptorSet = if (texture == null or texture.? == invalid_texture) self.dummy_texture.dset else @as(*Texture, @alignCast(@ptrCast(texture))).dset;
-    if (texture != null and dset == self.dummy_texture.dset) {
-        //slog.warn("rendering using dummy texture", .{});
-        if (enable_breakpoints) @breakpoint();
-    }
+    dev.cmdBindIndexBuffer(cmdbuf, cf.idx_buff, idx_offset, .uint16);
+    dev.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast(&cf.vtx_buff), &[_]vk.DeviceSize{vtx_offset});
+    var dset: vk.DescriptorSet = if (texture == null) self.dummy_texture.dset else blk: {
+        if (texture.? == invalid_texture) break :blk self.error_texture.dset;
+        const tex = @as(*Texture, @alignCast(@ptrCast(texture)));
+        if (tex.trace.index < tex.trace.addrs.len / 2 + 1) tex.trace.addAddr(@returnAddress(), "render"); // if trace has some free room, trace this
+        break :blk tex.dset;
+    };
     dev.cmdBindDescriptorSets(
         cmdbuf,
         .graphics,
@@ -523,32 +609,43 @@ pub fn drawClippedTriangles(self: *Backend, texture: ?*anyopaque, vtx: []const V
         null,
     );
     dev.cmdDrawIndexed(cmdbuf, @intCast(idx.len), 1, 0, 0, 0);
+
+    self.stats.draw_calls += 1;
+    self.stats.verts += @intCast(vtx.len);
+    self.stats.indices += @intCast(idx.len);
 }
 pub fn textureCreate(self: *Backend, pixels: [*]u8, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) *anyopaque {
-    // slog.debug("textureCreate {x}", .{@intFromEnum(img)});
+    var slot: usize = undefined;
+    const out_tex: *Texture = blk: {
+        for (self.textures, 0..) |*out_tex, s| {
+            slot = s;
+            if (out_tex.isNull()) break :blk out_tex;
+        }
+        slog.err("textureCreate: All texture slots! Texture discarded.", .{});
+        return invalid_texture;
+    };
     const tex = self.createAndUplaodTexture(pixels, width, height, interpolation) catch |err| {
         if (enable_breakpoints) @breakpoint();
         slog.err("Can't create texture: {}", .{err});
         return invalid_texture;
     };
-    for (self.textures) |*out_tex| {
-        if (out_tex.isNull()) {
-            out_tex.* = tex;
-            //slog.debug("textureCreate: {*}", .{out_tex});
-            return @ptrCast(out_tex);
-        }
-    }
-    slog.err("textureCreate: All texture slots are full! Texture discarded.", .{});
-    tex.deinit(self);
-    return invalid_texture;
+    out_tex.* = tex;
+    out_tex.trace = Texture.Trace.init;
+    out_tex.trace.addAddr(@returnAddress(), "create");
+
+    self.stats.textures_alive += 1;
+    self.stats.textures_mem += self.dev.getImageMemoryRequirements(out_tex.img).size;
+    //slog.debug("textureCreate {} ({x}) | {}", .{ slot, @intFromPtr(out_tex), self.stats.textures_alive });
+    return @ptrCast(out_tex);
 }
 pub fn textureCreateTarget(self: *Backend, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) !*anyopaque {
+    _ = self; // autofix
     _ = width; // autofix
     _ = height; // autofix
     _ = interpolation; // autofix
     // self.renderTarget(invalid_texture);
-    return @ptrCast(&self.dummy_texture);
-    // return try self.base_backend.textureCreateTarget(width, height, interpolation);
+    //return @ptrCast(&self.dummy_texture);
+    return error.NotSupported;
 }
 pub fn textureRead(self: *Backend, texture: *anyopaque, pixels_out: [*]u8, width: u32, height: u32) !void {
     _ = texture; // autofix
@@ -560,12 +657,13 @@ pub fn textureRead(self: *Backend, texture: *anyopaque, pixels_out: [*]u8, width
     // return try self.base_backend.textureRead(texture, pixels_out, width, height);
 }
 pub fn textureDestroy(self: *Backend, texture: *anyopaque) void {
-    _ = self; // autofix
     if (texture == invalid_texture) return;
-    // slog.debug("textureDestroy({*})", .{texture});
-    // const tex: *Texture = @ptrCast(@alignCast(texture));
-    // tex.deinit(self);
-    // tex.* = .{};
+    const dslot = self.destroy_textures_offset;
+    self.destroy_textures_offset = (dslot + 1) % @as(u16, @intCast(self.destroy_textures.len));
+    if (self.destroy_textures[dslot] != 0xFFFF)
+        self.destroy_textures[dslot] = @intCast((@intFromPtr(texture) - @intFromPtr(self.textures.ptr)) / @sizeOf(Texture));
+    self.current_frame.destroy_textures_len += 1;
+    // slog.debug("schedule destroy texture: {} ({x})", .{ self.destroy_textures[dslot], @intFromPtr(texture) });
 }
 pub fn renderTarget(self: *Backend, texture: ?*anyopaque) void {
     // slog.debug("renderTarget({?})", .{texture});
@@ -678,17 +776,6 @@ fn createPipeline(
         .alpha_blend_op = .add,
         .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
     };
-    // regular alpha
-    // const pcbas = vk.PipelineColorBlendAttachmentState{
-    //     .blend_enable = vk.TRUE,
-    //     .src_color_blend_factor = .src_alpha,
-    //     .dst_color_blend_factor = .one_minus_src_alpha,
-    //     .color_blend_op = .add,
-    //     .src_alpha_blend_factor = .one,
-    //     .dst_alpha_blend_factor = .zero,
-    //     .alpha_blend_op = .add,
-    //     .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
-    // };
 
     const pcbsci = vk.PipelineColorBlendStateCreateInfo{
         .logic_op_enable = vk.FALSE,
@@ -736,41 +823,36 @@ fn createPipeline(
     return pipeline;
 }
 
+const AllocatedBuffer = struct {
+    buf: vk.Buffer,
+    mem: vk.DeviceMemory,
+};
+
+/// allocates space for staging, creates buffer, and copies content to it
 fn stageToBuffer(
     self: *@This(),
     buf_info: vk.BufferCreateInfo,
-    mreq: vk.MemoryRequirements,
     contents: []const u8,
-    inflight_free: bool,
-) !vk.Buffer {
+) !AllocatedBuffer {
     const buf = self.dev.createBuffer(&buf_info, self.vk_alloc) catch |err| {
         slog.err("createBuffer: {}", .{err});
         return err;
     };
-    const mreq2 = self.dev.getBufferMemoryRequirements(buf);
-    var mem_offset = self.host_vis_offset;
-    mem_offset = std.mem.alignForward(usize, mem_offset, mreq2.alignment);
-    if (mem_offset + mreq2.size > self.host_vis_data.len) mem_offset = 0;
-    self.dev.bindBufferMemory(buf, self.host_vis_mem, mem_offset) catch |err| {
-        slog.err("bindBufferMemory: {}", .{err});
-        self.dev.destroyBuffer(buf, self.vk_alloc);
-        return err;
-    };
-    @memcpy(self.host_vis_data[mem_offset..][0..contents.len], contents);
+    errdefer self.dev.destroyBuffer(buf, self.vk_alloc);
+    const mreq = self.dev.getBufferMemoryRequirements(buf);
+    const mem = try self.dev.allocateMemory(&.{ .allocation_size = mreq.size, .memory_type_index = self.host_vis_mem_idx }, self.vk_alloc);
+    errdefer self.dev.freeMemory(mem, self.vk_alloc);
+    const mem_offset = 0;
+    try self.dev.bindBufferMemory(buf, mem, mem_offset);
+    const data = @as([*]u8, @ptrCast((try self.dev.mapMemory(mem, mem_offset, vk.WHOLE_SIZE, .{})).?))[0..mreq.size];
+    @memcpy(data[0..contents.len], contents);
     if (!self.host_vis_coherent)
-        self.dev.flushMappedMemoryRanges(1, &.{.{ .memory = self.host_vis_mem, .offset = mem_offset, .size = mreq.size }}) catch |err|
-            slog.err("flushMappedMemoryRanges: {}", .{err});
-    mem_offset += mreq.size;
-    self.host_vis_offset = mem_offset;
-
-    if (!inflight_free) return buf;
-    if (self.inflight_buffer_offset > self.inflight_buffers.len) self.inflight_buffer_offset = 0;
-    self.inflight_buffers[self.inflight_buffer_offset] = buf;
-    self.inflight_buffer_offset += 1;
-    return buf;
+        try self.dev.flushMappedMemoryRanges(1, &.{.{ .memory = mem, .offset = mem_offset, .size = mreq.size }});
+    return .{ .buf = buf, .mem = mem };
 }
 
 fn beginSingleTimeCommands(self: *Self) !vk.CommandBuffer {
+    if (self.lockCB) |f| f(self.lock_userdata);
     var cmdbuf: vk.CommandBuffer = undefined;
     self.dev.allocateCommandBuffers(&.{
         .command_pool = self.cpool,
@@ -787,6 +869,7 @@ fn beginSingleTimeCommands(self: *Self) !vk.CommandBuffer {
 }
 
 fn endSingleTimeCommands(self: *Self, cmdbuf: vk.CommandBuffer) !void {
+    defer if (self.unlockCB) |f| f(self.lock_userdata);
     try self.dev.endCommandBuffer(cmdbuf);
     const qs = [_]vk.SubmitInfo{.{
         .wait_semaphore_count = 0,
@@ -805,31 +888,14 @@ fn endSingleTimeCommands(self: *Self, cmdbuf: vk.CommandBuffer) !void {
     };
 }
 
-// fn transitionImageLayout(self: *Self, img: vk.Image, format: vk.Format, old_layout: vk.ImageLayout, new_layout: vk.ImageLayout) void {
-//     const img_barrier = vk.ImageMemoryBarrier{
-//         .src_access_mask = .{},
-//         .dst_access_mask = .{ .transfer_write_bit = true },
-//         .old_layout = .undefined,
-//         .new_layout = .transfer_dst_optimal,
-//         .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-//         .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-//         .image = img,
-//         .subresource_range = srr,
-//     };
-//     dev.cmdPipelineBarrier(cmdbuf, .{ .host_bit = true }, .{ .transfer_bit = true }, .{}, 0, null, 0, null, 1, @ptrCast(&img_barrier));
-// }
-
 const Texture = struct {
     img: vk.Image = .null_handle,
     img_view: vk.ImageView = .null_handle,
     mem: vk.DeviceMemory = .null_handle,
     dset: vk.DescriptorSet = .null_handle,
 
-    pub const State = enum {
-        deinit,
-        recycled,
-        in_use,
-    };
+    trace: Trace = undefined,
+    const Trace = std.debug.ConfigurableTrace(6, 5, texture_tracing);
 
     pub fn isNull(self: @This()) bool {
         return self.dset == .null_handle;
@@ -838,7 +904,7 @@ const Texture = struct {
     pub fn deinit(tex: Texture, b: *Backend) void {
         const dev = b.dev;
         const vk_alloc = b.vk_alloc;
-        // TODO: descriptor set individual free ?
+        dev.freeDescriptorSets(b.dpool, 1, &[_]vk.DescriptorSet{tex.dset}) catch |err| slog.err("Failed to free descriptor set: {}", .{err});
         dev.destroyImageView(tex.img_view, vk_alloc);
         dev.destroyImage(tex.img, vk_alloc);
         dev.freeMemory(tex.mem, vk_alloc);
@@ -934,8 +1000,9 @@ pub fn createAndUplaodTexture(self: *Backend, pixels: [*]const u8, width: u32, h
         .size = mreq.size,
         .usage = .{ .transfer_src_bit = true },
         .sharing_mode = .exclusive,
-    }, mreq, pixels[0 .. width * height * 4], false);
-    defer dev.destroyBuffer(img_staging, self.vk_alloc);
+    }, pixels[0 .. width * height * 4]);
+    defer dev.destroyBuffer(img_staging.buf, self.vk_alloc);
+    defer dev.freeMemory(img_staging.mem, self.vk_alloc);
 
     { // transition image to dst_optimal
         const img_barrier = vk.ImageMemoryBarrier{
@@ -967,7 +1034,7 @@ pub fn createAndUplaodTexture(self: *Backend, pixels: [*]const u8, width: u32, h
             .image_offset = .{ .x = 0, .y = 0, .z = 0 },
             .image_extent = .{ .width = width, .height = height, .depth = 1 },
         };
-        dev.cmdCopyBufferToImage(cmdbuf, img_staging, img, .transfer_dst_optimal, 1, @ptrCast(&buff_img_copy));
+        dev.cmdCopyBufferToImage(cmdbuf, img_staging.buf, img, .transfer_dst_optimal, 1, @ptrCast(&buff_img_copy));
 
         try self.endSingleTimeCommands(cmdbuf);
         cmdbuf = try self.beginSingleTimeCommands();
@@ -1025,3 +1092,14 @@ const VertexBindings = struct {
         },
     };
 };
+
+pub const tex_binding = 1; // shader binding slot must match shader
+// pub const ubo_binding = 0; // uniform binding slot must match shader
+// const Uniform = extern struct {
+//     viewport_size: @Vector(2, f32),
+// };
+
+/// device memory min alignment
+/// we could query it at runtime, but this is reasonable safe number. We don't use this for anything critical.
+/// https://vulkan.gpuinfo.org/displaydevicelimit.php?name=minMemoryMapAlignment&platform=all
+const vk_alignment = if (builtin.target.os.tag.isDarwin()) 16384 else 4096;

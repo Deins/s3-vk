@@ -1,3 +1,7 @@
+//! Vulkan application context and initialization utilities
+//! In general this provides only basics, should be customized for more advanced use cases.
+//! VkContext - stores in single struct for convenience all important device handles, instance & device info
+//! Declares vulkan api version to use & extensions
 const std = @import("std");
 const vk = @import("vulkan");
 const slog = std.log.scoped(.vk_ctx);
