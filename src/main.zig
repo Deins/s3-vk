@@ -30,10 +30,10 @@ const preferred_present_mode: []const vk.PresentModeKHR = &[_]vk.PresentModeKHR{
 
 /// how many frames in flight we want
 /// NOTE: swapchain image count = prefered_frames_in_flight + 1 (because 1 is being presented and not worked on)
-const prefered_frames_in_flight = 1;
+const prefered_frames_in_flight = 2;
 /// just in rare case we don't get `prefered_frames_in_flight` as fallback
 /// max frames in flight app can support (in case device requires more than preferred)
-const max_frames_in_flight = 1;
+const max_frames_in_flight = 3;
 
 var gpa_instance = std.heap.GeneralPurposeAllocator(.{}){};
 const gpa = gpa_instance.allocator();
@@ -110,13 +110,13 @@ pub fn main() !void {
     }
     var swapchain = Swapchain.init(&ctx, alloc, .{
         .extent = vk.Extent2D{ .width = init_w, .height = init_h },
-        .prefered_image_count = prefered_frames_in_flight + 1, // one is consumed by presentation engine displaying it
+        .prefered_image_count = prefered_frames_in_flight,
         .preferred_present_mode = preferred_present_mode,
     }) catch |err| {
         @breakpoint();
         std.debug.panic("Can't create swapchain: {}", .{err});
     };
-    if (swapchain.swap_images.len - 1 > max_frames_in_flight) std.debug.panic("Swapchain gave us more images than we can handle {}/{}!", .{ swapchain.swap_images.len, max_frames_in_flight });
+    if (swapchain.swap_images.len > max_frames_in_flight) std.debug.panic("Swapchain gave us more images than we can handle {}/{}!", .{ swapchain.swap_images.len, max_frames_in_flight });
     defer swapchain.deinit();
 
     const pipeline_layout = try ctx.dev.createPipelineLayout(&.{
@@ -245,7 +245,7 @@ pub fn main() !void {
 
         { // begin render-pass & reset viewport
             const clear = vk.ClearValue{
-                .color = .{ .float_32 = .{ 0, 0, 0, 1 } },
+                .color = .{ .float_32 = .{ 0, 0, 0, 0 } },
             };
             const viewport = vk.Viewport{
                 .x = 0,
@@ -259,8 +259,7 @@ pub fn main() !void {
                 .offset = .{ .x = 0, .y = 0 },
                 .extent = swapchain.extent,
             };
-            const render_area =
-                ctx.dev.cmdBeginRenderPass(cmdbuf, &.{
+            ctx.dev.cmdBeginRenderPass(cmdbuf, &.{
                 .render_pass = render_pass,
                 .framebuffer = framebuffers[swapchain.image_index],
                 .render_area = vk.Rect2D{
@@ -270,23 +269,22 @@ pub fn main() !void {
                 .clear_value_count = 1,
                 .p_clear_values = @ptrCast(&clear),
             }, .@"inline");
-            _ = render_area; // autofix
             ctx.dev.cmdSetViewport(cmdbuf, 0, 1, @ptrCast(&viewport));
             ctx.dev.cmdSetScissor(cmdbuf, 0, 1, @ptrCast(&scissor));
         }
 
-        { // draw triangle scene
-            ctx.dev.cmdBindPipeline(cmdbuf, .graphics, pipeline);
-            const offset = [_]vk.DeviceSize{0};
-            ctx.dev.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast(&buffer), &offset);
-            ctx.dev.cmdDraw(cmdbuf, vertices.len, 1, 0, 0);
-        }
+        // { // draw triangle scene
+        //     ctx.dev.cmdBindPipeline(cmdbuf, .graphics, pipeline);
+        //     const offset = [_]vk.DeviceSize{0};
+        //     ctx.dev.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast(&buffer), &offset);
+        //     ctx.dev.cmdDraw(cmdbuf, vertices.len, 1, 0, 0);
+        // }
 
         //
         // Render DVUI
         //
         const stats = dvui_vk_backend.stats; // grab copy of stats
-        dvui_vk_backend.beginFrame(.{ .cmdbuf = cmdbuf, .queue = ctx.main_queue, .command_pool = pool });
+        dvui_vk_backend.beginFrame(cmdbuf, swapchain.extent);
         // beginWait coordinates with waitTime below to run frames only when needed
         const nstime = win.beginWait(base_backend.hasEvent());
         try win.begin(nstime);
@@ -315,6 +313,7 @@ pub fn main() !void {
         // End render and present
         //
         ctx.dev.cmdEndRenderPass(cmdbuf);
+        // _ = dvui_vk_backend.endFrame();
         try ctx.dev.endCommandBuffer(cmdbuf);
 
         present_state = swapchain.present(cmdbuf) catch |err| switch (err) {
@@ -355,7 +354,7 @@ fn gui_frame() !void {
 fn gui_stats(stats: DvuiVkRenderer.Stats, preallocated_mem: usize) !void {
     var m = try dvui.menu(@src(), .vertical, .{ .background = true, .expand = null, .gravity_x = 1.0, .min_size_content = .{ .w = 200, .h = 100 } });
     defer m.deinit();
-    try dvui.label(@src(), "draw_calls: {}\nverts: {}\nindices: {}\ntextures: {}\ntexture mem: {:.1}\npreallocated gpu mem: {:.1}", .{
+    try dvui.label(@src(), "draw_calls: {}\nverts: {}\nindices: {}\ntextures: {}\ngpu texture mem: {:.1}\ngpu staging mem: {:.1}", .{
         stats.draw_calls,
         stats.verts,
         stats.indices,
