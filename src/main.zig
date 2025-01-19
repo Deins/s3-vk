@@ -31,7 +31,7 @@ const preferred_present_mode: []const vk.PresentModeKHR = &[_]vk.PresentModeKHR{
 /// how many frames in flight we want
 /// NOTE: swapchain image count = prefered_frames_in_flight + 1 (because 1 is being presented and not worked on)
 const prefered_frames_in_flight = 2;
-/// just in rare case we don't get `prefered_frames_in_flight` as fallback
+/// just in case we don't get `prefered_frames_in_flight` as fallback
 /// max frames in flight app can support (in case device requires more than preferred)
 const max_frames_in_flight = 3;
 
@@ -191,6 +191,12 @@ pub fn main() !void {
         .queue = ctx.main_queue,
         .comamnd_pool = pool,
         .mem_props = ctx.phy_devices.items(.mem_props)[ctx.selected_phy_device_idx],
+        // tight limits
+        .max_indices_per_frame = 1024 * 96,
+        .max_vertices_per_frame = 1024 * 32,
+        // test overflow 
+        // .max_indices_per_frame = 1024 * 32,
+        // .max_vertices_per_frame = 1024 * 16,
     }); // init on top of already initialized backend, overrides rendering
     defer dvui_vk_backend.deinit(alloc);
     defer base_backend.deinit(); // deinit base backend first, so that we can still handle textureDestroy etc.
@@ -198,6 +204,7 @@ pub fn main() !void {
     // init dvui Window (maps onto a single OS window)
     var win = try dvui.Window.init(@src(), gpa, dvui_vk_backend.backend(), .{});
     defer win.deinit();
+    win.theme = win.themes.get("Adwaita Dark").?;
 
     // backend.initial_scale = sdl.SDL_GetDisplayContentScale(sdl.SDL_GetDisplayForWindow(sdl_win));
     // dvui.log.info("SDL3 backend scale {d}", .{backend.initial_scale});
@@ -273,12 +280,12 @@ pub fn main() !void {
             ctx.dev.cmdSetScissor(cmdbuf, 0, 1, @ptrCast(&scissor));
         }
 
-        // { // draw triangle scene
-        //     ctx.dev.cmdBindPipeline(cmdbuf, .graphics, pipeline);
-        //     const offset = [_]vk.DeviceSize{0};
-        //     ctx.dev.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast(&buffer), &offset);
-        //     ctx.dev.cmdDraw(cmdbuf, vertices.len, 1, 0, 0);
-        // }
+        { // draw triangle scene
+            ctx.dev.cmdBindPipeline(cmdbuf, .graphics, pipeline);
+            const offset = [_]vk.DeviceSize{0};
+            ctx.dev.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast(&buffer), &offset);
+            ctx.dev.cmdDraw(cmdbuf, vertices.len, 1, 0, 0);
+        }
 
         //
         // Render DVUI
@@ -289,13 +296,11 @@ pub fn main() !void {
         const nstime = win.beginWait(base_backend.hasEvent());
         try win.begin(nstime);
 
-        clearTextureCaches(&win);
-
         const quit = try base_backend.addAllEvents(&win);
         if (quit) break :main_loop;
 
         try gui_frame();
-        try gui_stats(stats, dvui_vk_backend.host_vis_data.len);
+        try gui_stats(stats, &dvui_vk_backend);
 
         const end_micros = try win.end(.{});
 
@@ -351,35 +356,36 @@ fn gui_frame() !void {
     try dvui.Examples.demo();
 }
 
-fn gui_stats(stats: DvuiVkRenderer.Stats, preallocated_mem: usize) !void {
-    var m = try dvui.menu(@src(), .vertical, .{ .background = true, .expand = null, .gravity_x = 1.0, .min_size_content = .{ .w = 200, .h = 100 } });
+fn gui_stats(stats: DvuiVkRenderer.Stats, vk_backend: *DvuiVkRenderer) !void {
+    var m = try dvui.box(@src(), .vertical, .{ .background = true, .expand = null, .gravity_x = 1.0, .min_size_content = .{ .w = 256, .h = 100 } });
     defer m.deinit();
-    try dvui.label(@src(), "draw_calls: {}\nverts: {}\nindices: {}\ntextures: {}\ngpu texture mem: {:.1}\ngpu staging mem: {:.1}", .{
-        stats.draw_calls,
-        stats.verts,
-        stats.indices,
-        stats.textures_alive,
-        std.fmt.fmtIntSizeBin(stats.textures_mem),
-        std.fmt.fmtIntSizeBin(preallocated_mem),
-    }, .{});
-}
+    var prc: f32 = 0;
 
-fn clearTextureCaches(win: *dvui.Window) void {
-    const self = win;
-    _ = self; // autofix
-    // {
-    //     var removable: u32 = 0;
-    //     var it = self.texture_cache.iterator();
-    //     while (it.next()) |item| {
-    //         if (!item.value_ptr.used) {
-    //             //self.backend.textureDestroy(item.value_ptr.texture);
-    //             removable += 1;
-    //         }
-    //         break;
-    //     }
-    //     //self.texture_cache.clearRetainingCapacity();
-    //     slog.debug("removable {} / {}", .{ removable, self.texture_cache.count() });
-    // }
+    try dvui.labelNoFmt(@src(), "DVUI VK Backend stats", .{ .expand = .horizontal, .gravity_x = 0.5, .font_style = .heading });
+    try dvui.label(@src(), "draw_calls:  {}", .{stats.draw_calls}, .{ .expand = .horizontal });
+
+    const idx_max = vk_backend.current_frame.idx_data.len / @sizeOf(DvuiVkRenderer.Indice);
+    try dvui.label(@src(), "indices: {} / {}", .{ stats.indices, idx_max }, .{ .expand = .horizontal });
+    prc = @as(f32, @floatFromInt(stats.indices)) / @as(f32, @floatFromInt(idx_max));
+    try dvui.progress(@src(), .{ .percent = prc }, .{ .expand = .horizontal, .color_accent = .{ .color = dvui.Color.fromHSLuv(@max(12, (1 - prc) * 166), 99, 50, 100) } });
+
+    const verts_max = vk_backend.current_frame.vtx_data.len / @sizeOf(DvuiVkRenderer.Vertex);
+    try dvui.label(@src(), "vertices:  {} / {}", .{ stats.verts, verts_max }, .{ .expand = .horizontal });
+    prc = @as(f32, @floatFromInt(stats.verts)) / @as(f32, @floatFromInt(verts_max));
+    try dvui.progress(@src(), .{ .percent = prc }, .{ .expand = .horizontal, .color_accent = .{ .color = dvui.Color.fromHSLuv(@max(12, (1 - prc) * 166), 99, 50, 100) } });
+
+    try dvui.label(@src(), "Textures:", .{}, .{ .expand = .horizontal, .font_style = .caption_heading });
+    try dvui.label(@src(), "count:  {}", .{stats.textures_alive}, .{ .expand = .horizontal });
+    try dvui.label(@src(), "mem (gpu): {:.1}", .{std.fmt.fmtIntSizeBin(stats.textures_mem)}, .{ .expand = .horizontal });
+
+    try dvui.label(@src(), "Static/Preallocated memory (gpu):", .{}, .{ .expand = .horizontal, .font_style = .caption_heading });
+    const prealloc_mem = vk_backend.host_vis_data.len;
+    try dvui.label(@src(), "total:  {:.1}", .{std.fmt.fmtIntSizeBin(prealloc_mem)}, .{ .expand = .horizontal });
+    const prealloc_mem_frame = prealloc_mem / vk_backend.frames.len;
+    const prealloc_mem_frame_used = stats.indices * @sizeOf(DvuiVkRenderer.Indice) + stats.verts * @sizeOf(DvuiVkRenderer.Vertex);
+    prc = @as(f32, @floatFromInt(prealloc_mem_frame_used)) / @as(f32, @floatFromInt(prealloc_mem_frame));
+    try dvui.label(@src(), "current frame:  {:.1} / {:.1}", .{ std.fmt.fmtIntSizeBin(prealloc_mem_frame_used), std.fmt.fmtIntSizeBin(prealloc_mem_frame) }, .{ .expand = .horizontal });
+    try dvui.progress(@src(), .{ .percent = prc }, .{ .expand = .horizontal, .color_accent = .{ .color = dvui.Color.fromHSLuv(@max(12, (1 - prc) * 166), 99, 50, 100) } });
 }
 
 fn createRenderPass(gc: *VkContext, swapchain: Swapchain) !vk.RenderPass {

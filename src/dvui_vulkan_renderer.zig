@@ -567,6 +567,13 @@ pub fn drawClippedTriangles(self: *Backend, texture: ?*anyopaque, vtx: []const V
     const cf = self.current_frame;
     const vtx_bytes = vtx.len * @sizeOf(Vertex);
     const idx_bytes = idx.len * @sizeOf(Indice);
+
+    {   // updates stats even if draw is skipped due to overflow
+        self.stats.draw_calls += 1;
+        self.stats.verts += @intCast(vtx.len);
+        self.stats.indices += @intCast(idx.len);
+    }
+
     if (cf.vtx_data[cf.vtx_offset..].len < vtx_bytes) {
         if (!self.vtx_overflow_logged) slog.warn("vertex buffer out of space", .{});
         self.vtx_overflow_logged = true;
@@ -633,10 +640,6 @@ pub fn drawClippedTriangles(self: *Backend, texture: ?*anyopaque, vtx: []const V
         null,
     );
     dev.cmdDrawIndexed(cmdbuf, @intCast(idx.len), 1, 0, 0, 0);
-
-    self.stats.draw_calls += 1;
-    self.stats.verts += @intCast(vtx.len);
-    self.stats.indices += @intCast(idx.len);
 }
 
 fn findEmptyTextureSlot(self: *Backend) ?TextureIdx {
@@ -1025,7 +1028,7 @@ pub fn endSingleTimeCommands(self: *Self, cmdbuf: vk.CommandBuffer) !void {
         .p_signal_semaphores = null,
     }};
     try self.dev.queueSubmit(self.queue, 1, &qs, .null_handle);
-    // TODO: is there better way to sync this than stalling the queue?
+    // TODO: is there better way to sync this than stalling the queue? barriers or something
     self.dev.queueWaitIdle(self.queue) catch |err| {
         slog.warn("queueWaitIdle failed: {}", .{err});
     };
