@@ -10,12 +10,11 @@
 //!   Currently renderer itself performs almost no locking with gpu except when creating new textures. Synchronization  is archived by using frames in flight as sync:
 //!   It is assumed that swapchain has limited number of images (not too many) and at worst case CPU can issue only that many frames before it will have no new frames where render to. That is good blocking/sync point.
 //!   By using that knowledge we delay any host->gpu resource operations by max_frames_in_flight to be sure there won't be any data races. (for example textureDeletion is delayed to make sure gpu doesn't use it any more)
-//!   But at the moment swapchain management is left for application to do, so application must make sure this is enforced and pass in this information as `max_frames_in_flight` during int.
-//!   Otherwise gpu frame data can get overwritten while its still being used leading to undefined behaviour.
-//! * Memory: all space for vertex & index buffers is preallocated at start requiring setting appropriate limits in options. Requests to render over limit is safe but will lead to draw commands being dropped.
+//!   But as swapchain management is left for application to do, application must make sure this is enforced and pass in this information as `max_frames_in_flight` during int.
+//!   Otherwise gpu frame data can get overwritten while its still being used leading to undefined behavior.
+//! * Memory: all space for vertex & index buffers is preallocated at start requiring setting appropriate limits in options. Requests to render over limit is safe but will lead to draw commands being ignored.
 //!   Texture bookkeeping is also preallocated. But images themselves are allocated individually at runtime. Currently 1 image = 1 allocation which is ok for large or few images,
 //!   but not great for many smaller images that can eat in max gpu allocation limit. TODO: implement hooks for general purpose allocator
-//!   TODO: currently there also seems to be texture leaks from dvui itself, especially when scaling content. Not all textures seem to be destroyed.
 //!
 const std = @import("std");
 const builtin = @import("builtin");
@@ -52,7 +51,7 @@ pub const InitOptions = struct {
     /// queue - used only for texture upload,
     /// used here only once during initialization, afterwards texture upload queue must be provided with beginFrame()
     queue: vk.Queue,
-    /// command pool - used only for texuture upload
+    /// command pool - used only for texture upload
     comamnd_pool: vk.CommandPool,
     /// vulkan physical device
     pdev: vk.PhysicalDevice,
@@ -73,7 +72,7 @@ pub const InitOptions = struct {
     max_vertices_per_frame: u32 = 1024 * 64,
 
     /// Maximum number of alive textures supported. global (across all overlapping frames)
-    /// Note: as this is only book keeping limit it can be set quite high. Real texture memory usage could be more concernig, as well as large allocation count.
+    /// Note: as this is only book keeping limit it can be set quite high. Real texture memory usage could be more concerning, as well as large allocation count.
     max_textures: TextureIdx = 256,
 
     /// Maximum number of render textures
@@ -489,10 +488,6 @@ pub fn endFrame(self: *Self) vk.CommandBuffer {
     return cmdbuf;
 }
 
-/// call this after render pass has ended
-/// used to finish submitting textures
-// pub fn endFrame() void {}
-
 //
 // Backend interface function overrides
 //  see: dvui/Backend.zig
@@ -510,14 +505,9 @@ pub fn sleep(self: *Backend, ns: u64) void {
 pub fn begin(self: *Self, arena: std.mem.Allocator) void {
     self.render_target = null;
     if (self.cmdbuf == .null_handle) @panic("dvui_vulkan_renderer: Command bufer not set before rendering started!");
-    // TODO: get rid of this or do it more cleanly
-    // very risky as sdl_backend calls renderer, but have no other way to pass through arena
+    // TODO: FIXME: get rid of this or do it more cleanly
+    //  WARNING: very risky as sdl_backend calls renderer, but have no other way to pass through arena
     self.base_backend.begin(arena); // call base
-
-    //std.log.warn("DvuiVKRendderBegin...", .{});
-    // self.base_backend.begin(arena);
-    //dvui.backend.begin(@ptrCast(@alignCast(self.base_backend)), arena);
-    //std.log.warn("...DvuiVKRendderBegin", .{});
 
     const dev = self.dev;
     const cmdbuf = self.cmdbuf;
