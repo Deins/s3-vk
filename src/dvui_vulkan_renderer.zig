@@ -165,8 +165,8 @@ stats: Stats = .{}, // just for info / dbg
 
 /// for potentially multi threaded shared resources, lock callbacks can be set that will be called
 const LockCallbacks = struct {
-    lockCB: *const fn (userdata: ?*anyopaque) void = null,
-    unlockCB: *const fn (userdata: ?*anyopaque) void = null,
+    lockCB: *const fn (userdata: ?*anyopaque) void = undefined,
+    unlockCB: *const fn (userdata: ?*anyopaque) void = undefined,
     lock_userdata: ?*anyopaque = null, // user defined data that will be returned in callbacks
 };
 
@@ -420,7 +420,7 @@ pub fn init(alloc: std.mem.Allocator, base_backend: *dvui.backend, opt: InitOpti
 /// for sync safety, better call queueWaitIdle before destruction
 pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
     for (self.texture_targets) |tt| if (!tt.isNull()) {
-        self.textureDestroy(&self.textures[tt.tex_idx]);
+        self.textureDestroy(.{ .ptr = &self.textures[tt.tex_idx], .width = 0, .height = 0 });
         self.dev.destroyFramebuffer(tt.framebuffer, self.vk_alloc);
     };
     alloc.free(self.texture_targets);
@@ -550,15 +550,16 @@ pub fn windowSize(self: *Backend) Size {
 pub fn contentScale(self: *Backend) f32 {
     return self.base_backend.contentScale();
 }
-pub fn drawClippedTriangles(self: *Backend, texture: ?*anyopaque, vtx: []const Vertex, idx: []const Indice, clipr: ?dvui.Rect) void {
+pub fn drawClippedTriangles(self: *Backend, texture_: ?dvui.Texture, vtx: []const Vertex, idx: []const Indice, clipr: ?dvui.Rect) void {
     if (self.render_target != null) return; // TODO: render to textures
+    const texture: ?*anyopaque = if (texture_) |t| @as(*anyopaque, @alignCast(@ptrCast(t.ptr))) else null;
     const dev = self.dev;
     const cmdbuf = if (self.render_target) |t| t else self.cmdbuf;
     const cf = self.current_frame;
     const vtx_bytes = vtx.len * @sizeOf(Vertex);
     const idx_bytes = idx.len * @sizeOf(Indice);
 
-    {   // updates stats even if draw is skipped due to overflow
+    { // updates stats even if draw is skipped due to overflow
         self.stats.draw_calls += 1;
         self.stats.verts += @intCast(vtx.len);
         self.stats.indices += @intCast(idx.len);
@@ -640,13 +641,13 @@ fn findEmptyTextureSlot(self: *Backend) ?TextureIdx {
     return null;
 }
 
-pub fn textureCreate(self: *Backend, pixels: [*]u8, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) *anyopaque {
-    const slot = self.findEmptyTextureSlot() orelse return invalid_texture;
+pub fn textureCreate(self: *Backend, pixels: [*]u8, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) dvui.Texture {
+    const slot = self.findEmptyTextureSlot() orelse return .{ .ptr = invalid_texture, .width = 1, .height = 1 };
     const out_tex: *Texture = &self.textures[slot];
     const tex = self.createAndUplaodTexture(pixels, width, height, interpolation) catch |err| {
         if (enable_breakpoints) @breakpoint();
         slog.err("Can't create texture: {}", .{err});
-        return invalid_texture;
+        return .{ .ptr = invalid_texture, .width = 1, .height = 1 };
     };
     out_tex.* = tex;
     out_tex.trace.addAddr(@returnAddress(), "create");
@@ -654,9 +655,9 @@ pub fn textureCreate(self: *Backend, pixels: [*]u8, width: u32, height: u32, int
     self.stats.textures_alive += 1;
     self.stats.textures_mem += self.dev.getImageMemoryRequirements(out_tex.img).size;
     //slog.debug("textureCreate {} ({x}) | {}", .{ slot, @intFromPtr(out_tex), self.stats.textures_alive });
-    return @ptrCast(out_tex);
+    return .{ .ptr = @ptrCast(out_tex), .width = width, .height = height };
 }
-pub fn textureCreateTarget(self: *Backend, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) !*anyopaque {
+pub fn textureCreateTarget(self: *Backend, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) !dvui.Texture {
     const enable = false;
     if (!enable) return error.NotSupported else {
         const target_slot = blk: {
@@ -712,22 +713,23 @@ pub fn textureCreateTarget(self: *Backend, width: u32, height: u32, interpolatio
         return &self.texture_targets[target_slot];
     }
 }
-pub fn textureRead(self: *Backend, texture: *anyopaque, pixels_out: [*]u8, width: u32, height: u32) !void {
+pub fn textureRead(self: *Backend, texture: dvui.Texture, pixels_out: [*]u8, width: u32, height: u32) !void {
     // return try self.base_backend.textureRead(texture, pixels_out, width, height);
     slog.debug("textureRead({}, {*}, {}x{}) Not implemented!", .{ texture, pixels_out, width, height });
     _ = self; // autofix
     return error.NotSupported;
 }
-pub fn textureDestroy(self: *Backend, texture: *anyopaque) void {
-    if (texture == invalid_texture) return;
+pub fn textureDestroy(self: *Backend, texture: dvui.Texture) void {
+    if (texture.ptr == invalid_texture) return;
     const dslot = self.destroy_textures_offset;
     self.destroy_textures_offset = (dslot + 1) % @as(u16, @intCast(self.destroy_textures.len));
-    if (self.destroy_textures[dslot] != 0xFFFF)
-        self.destroy_textures[dslot] = @intCast((@intFromPtr(texture) - @intFromPtr(self.textures.ptr)) / @sizeOf(Texture));
+    if (self.destroy_textures[dslot] != 0xFFFF) {
+        self.destroy_textures[dslot] = @intCast((@intFromPtr(texture.ptr) - @intFromPtr(self.textures.ptr)) / @sizeOf(Texture));
+    }
     self.current_frame.destroy_textures_len += 1;
     // slog.debug("schedule destroy texture: {} ({x})", .{ self.destroy_textures[dslot], @intFromPtr(texture) });
 }
-pub fn renderTarget(self: *Backend, texture: ?*anyopaque) void {
+pub fn renderTarget(self: *Backend, texture: dvui.Texture) void {
     // TODO: all errors are set to unreachable, add handling?
     slog.debug("renderTarget({?})", .{texture});
     const dev = self.dev;
@@ -738,9 +740,7 @@ pub fn renderTarget(self: *Backend, texture: ?*anyopaque) void {
         self.endSingleTimeCommands(cmdbuf) catch unreachable;
     }
 
-    if (texture == null) return;
-
-    const tt: *TextureTarget = @ptrCast(@alignCast(texture));
+    const tt: *TextureTarget = @ptrCast(@alignCast(texture.ptr));
     const cmdbuf = self.beginSingleTimeCommands() catch unreachable;
     self.render_target = cmdbuf;
 

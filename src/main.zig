@@ -194,7 +194,7 @@ pub fn main() !void {
         // tight limits
         .max_indices_per_frame = 1024 * 96,
         .max_vertices_per_frame = 1024 * 32,
-        // test overflow 
+        // test overflow
         // .max_indices_per_frame = 1024 * 32,
         // .max_vertices_per_frame = 1024 * 16,
     }); // init on top of already initialized backend, overrides rendering
@@ -367,12 +367,12 @@ fn gui_stats(stats: DvuiVkRenderer.Stats, vk_backend: *DvuiVkRenderer) !void {
     const idx_max = vk_backend.current_frame.idx_data.len / @sizeOf(DvuiVkRenderer.Indice);
     try dvui.label(@src(), "indices: {} / {}", .{ stats.indices, idx_max }, .{ .expand = .horizontal });
     prc = @as(f32, @floatFromInt(stats.indices)) / @as(f32, @floatFromInt(idx_max));
-    try dvui.progress(@src(), .{ .percent = prc }, .{ .expand = .horizontal, .color_accent = .{ .color = dvui.Color.fromHSLuv(@max(12, (1 - prc*prc) * 155), 99, 50, 100) } });
+    try dvui.progress(@src(), .{ .percent = prc }, .{ .expand = .horizontal, .color_accent = .{ .color = dvui.Color.fromHSLuv(@max(12, (1 - prc * prc) * 155), 99, 50, 100) } });
 
     const verts_max = vk_backend.current_frame.vtx_data.len / @sizeOf(DvuiVkRenderer.Vertex);
     try dvui.label(@src(), "vertices:  {} / {}", .{ stats.verts, verts_max }, .{ .expand = .horizontal });
     prc = @as(f32, @floatFromInt(stats.verts)) / @as(f32, @floatFromInt(verts_max));
-    try dvui.progress(@src(), .{ .percent = prc }, .{ .expand = .horizontal, .color_accent = .{ .color = dvui.Color.fromHSLuv(@max(12, (1 - prc*prc) * 155), 99, 50, 100) } });
+    try dvui.progress(@src(), .{ .percent = prc }, .{ .expand = .horizontal, .color_accent = .{ .color = dvui.Color.fromHSLuv(@max(12, (1 - prc * prc) * 155), 99, 50, 100) } });
 
     try dvui.label(@src(), "Textures:", .{}, .{ .expand = .horizontal, .font_style = .caption_heading });
     try dvui.label(@src(), "count:  {}", .{stats.textures_alive}, .{ .expand = .horizontal });
@@ -385,7 +385,7 @@ fn gui_stats(stats: DvuiVkRenderer.Stats, vk_backend: *DvuiVkRenderer) !void {
     const prealloc_mem_frame_used = stats.indices * @sizeOf(DvuiVkRenderer.Indice) + stats.verts * @sizeOf(DvuiVkRenderer.Vertex);
     try dvui.label(@src(), "current frame:  {:.1} / {:.1}", .{ std.fmt.fmtIntSizeBin(prealloc_mem_frame_used), std.fmt.fmtIntSizeBin(prealloc_mem_frame) }, .{ .expand = .horizontal });
     prc = @as(f32, @floatFromInt(prealloc_mem_frame_used)) / @as(f32, @floatFromInt(prealloc_mem_frame));
-    try dvui.progress(@src(), .{ .percent = prc }, .{ .expand = .horizontal, .color_accent = .{ .color = dvui.Color.fromHSLuv(@max(12, (1 - prc*prc) * 155), 99, 50, 100) } });
+    try dvui.progress(@src(), .{ .percent = prc }, .{ .expand = .horizontal, .color_accent = .{ .color = dvui.Color.fromHSLuv(@max(12, (1 - prc * prc) * 155), 99, 50, 100) } });
 }
 
 fn createRenderPass(gc: *VkContext, swapchain: Swapchain) !vk.RenderPass {
