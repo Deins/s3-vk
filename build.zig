@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const dvui_dep = b.dependency("dvui", .{ .sdl3 = true, .target = target, .optimize = optimize });
+    const dvui_dep = b.dependency("dvui", .{ .backend = .sdl3, .target = target, .optimize = optimize });
 
     const lib = b.addStaticLibrary(.{
         .name = "s3-vk",
@@ -61,8 +61,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_unit_tests.step);
 
     // dvui
-    exe_unit_tests.root_module.addImport("dvui", dvui_dep.module("dvui_sdl"));
-    exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl"));
+    // exe_unit_tests.root_module.addImport("dvui", dvui_dep.module("dvui_sdl"));
+    exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
 
     // SDL
     exe.addIncludePath(b.path("deps/SDL/include"));

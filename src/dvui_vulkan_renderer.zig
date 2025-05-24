@@ -544,7 +544,7 @@ pub fn pixelSize(self: *Backend) Size {
     // return self.base_backend.pixelSize();
     return .{ .w = @floatFromInt(self.framebuffer_size.width), .h = @floatFromInt(self.framebuffer_size.height) };
 }
-pub fn windowSize(self: *Backend) Size {
+pub fn windowSize(self: *Backend) dvui.Size.Natural {
     return self.base_backend.windowSize();
 }
 pub fn contentScale(self: *Backend) f32 {
@@ -729,6 +729,25 @@ pub fn textureDestroy(self: *Backend, texture: dvui.Texture) void {
     self.current_frame.destroy_textures_len += 1;
     // slog.debug("schedule destroy texture: {} ({x})", .{ self.destroy_textures[dslot], @intFromPtr(texture) });
 }
+
+/// Read pixel data (RGBA) from `texture` into `pixels_out`.
+pub fn textureReadTarget(self: *Backend, texture: dvui.TextureTarget, pixels_out: [*]u8) !void {
+    // return self.base_backend.textureReadTarget(self, texture, pixels_out);
+    _ = pixels_out;
+    _ = self;
+    _ = texture;
+    return error.NotSupported;
+}
+
+/// Convert texture target made with `textureCreateTarget` into return texture
+/// as if made by `textureCreate`.  After this call, texture target will not be
+/// used by dvui.
+pub fn textureFromTarget(self: *Backend, texture: dvui.TextureTarget) dvui.Texture {
+    // return self.base_backend.textureFromTarget(self, texture);
+    _ = texture;
+    return .{ .ptr = @ptrCast(&self.error_texture), .width = 0, .height = 0 };
+}
+
 pub fn renderTarget(self: *Backend, texture: dvui.Texture) void {
     // TODO: all errors are set to unreachable, add handling?
     slog.debug("renderTarget({?})", .{texture});
