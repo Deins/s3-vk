@@ -448,7 +448,14 @@ pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
 }
 
 pub fn backend(self: *Self) dvui.Backend {
-    return dvui.Backend.initWithCustomContext(Self, self, Self);
+    var b = dvui.Backend.init(@as(*dvui.backend, @ptrCast(self)), dvui.backend);
+    // hijack base backend by replacing vtable with our own
+    const I = dvui.Backend.VTable.I;
+    const implementation = Self;
+    inline for (@typeInfo(I).@"struct".decls) |decl| {
+        @field(b.vtable, decl.name) = @ptrCast(&@field(implementation, decl.name));
+    }
+    return b;
 }
 
 pub const RenderPassInfo = struct {

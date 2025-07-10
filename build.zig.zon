@@ -25,9 +25,9 @@
     // internet connectivity.
     .dependencies = .{
         .dvui = .{
-            .path = "deps/dvui",
-            // .url = "git+https://github.com/david-vanderson/dvui/?ref=HEAD#6bedaf83b9a63a9caf6d195fe0ed479370f2fdf9",
-            // .hash = "1220a6184f109f0e185fc811de2c5acdc2aa704b8b36c836d04bdadf941c9e6542e8",
+            // .path = "deps/dvui",
+            .url = "git+https://github.com/david-vanderson/dvui/?ref=HEAD#f39fec7b69c7d178e80bf23e488198dfe2571ec5",
+            .hash = "dvui-0.2.0-AQFJmeWozgDjXF0l7cavo8g6pXZpUTwpCCba5z4nqjxe",
         },
         .vulkan_zig = .{
             //.path = "deps/vulkan-zig",
