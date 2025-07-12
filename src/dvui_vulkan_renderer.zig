@@ -449,13 +449,56 @@ pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
 
 pub fn backend(self: *Self) dvui.Backend {
     var b = dvui.Backend.init(@as(*dvui.backend, @ptrCast(self)), dvui.backend);
-    // hijack base backend by replacing vtable with our own
-    const I = dvui.Backend.VTable.I;
-    const implementation = Self;
-    inline for (@typeInfo(I).@"struct".decls) |decl| {
-        @field(b.vtable, decl.name) = @ptrCast(&@field(implementation, decl.name));
+    {
+        // hijack base backend by replacing vtable with our own
+        // WARNING: this is not safe and asking for trouble, but done to allow only implementing rendering
+        // TODO: figure out how to do this cleanly
+        const implementation = Self;
+        { // manual type checks
+            // When updating dvui: copy paste from dvui.Backend.VTable.I here as RefVTable
+            const Context = Self;
+            const RefVTable = struct {
+                pub const nanoTime = *const fn (ctx: Context) i128;
+                pub const sleep = *const fn (ctx: Context, ns: u64) void;
+
+                pub const begin = *const fn (ctx: Context, arena: std.mem.Allocator) void;
+                pub const end = *const fn (ctx: Context) void;
+
+                pub const pixelSize = *const fn (ctx: Context) dvui.Size.Physical;
+                pub const windowSize = *const fn (ctx: Context) dvui.Size.Natural;
+                pub const contentScale = *const fn (ctx: Context) f32;
+
+                pub const drawClippedTriangles = *const fn (ctx: Context, texture: ?dvui.Texture, vtx: []const dvui.Vertex, idx: []const u16, clipr: ?dvui.Rect.Physical) void;
+
+                pub const textureCreate = *const fn (ctx: Context, pixels: [*]u8, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) dvui.Texture;
+                pub const textureDestroy = *const fn (ctx: Context, texture: dvui.Texture) void;
+                pub const textureFromTarget = *const fn (ctx: Context, texture: dvui.TextureTarget) dvui.Texture;
+
+                pub const textureCreateTarget = *const fn (ctx: Context, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) error{ OutOfMemory, TextureCreate }!dvui.TextureTarget;
+                pub const textureReadTarget = *const fn (ctx: Context, texture: dvui.TextureTarget, pixels_out: [*]u8) error{TextureRead}!void;
+                pub const renderTarget = *const fn (ctx: Context, texture: ?dvui.TextureTarget) void;
+
+                pub const clipboardText = *const fn (ctx: Context) error{OutOfMemory}![]const u8;
+                pub const clipboardTextSet = *const fn (ctx: Context, text: []const u8) error{OutOfMemory}!void;
+
+                pub const openURL = *const fn (ctx: Context, url: []const u8) error{OutOfMemory}!void;
+                pub const refresh = *const fn (ctx: Context) void;
+            };
+            if (@sizeOf(RefVTable) != @sizeOf(dvui.Backend.VTable.I)) @compileError("Backend not up to date with dvui!");
+            const I = RefVTable; // autofix
+            inline for (@typeInfo(I).@"struct".decls) |decl| {
+                const hasField = @hasDecl(implementation, decl.name);
+                const DeclType = @field(I, decl.name);
+                if (!hasField) @compileError("Backend type " ++ @typeName(implementation) ++ " has no declaration '" ++ decl.name ++ ": " ++ @typeName(DeclType) ++ "'");
+            }
+        }
+        const I = dvui.Backend.VTable.I;
+        inline for (@typeInfo(I).@"struct".decls) |decl| {
+            // DANGER: bypasses type safety here, but it should be cought above as long as its kept up to date
+            @field(b.vtable, decl.name) = @ptrCast(&@field(implementation, decl.name));
+        }
+        return b;
     }
-    return b;
 }
 
 pub const RenderPassInfo = struct {
