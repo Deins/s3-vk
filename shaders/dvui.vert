@@ -2,10 +2,6 @@
 
 layout(push_constant) uniform ScreenTransform { vec2 view_scale; vec2 view_translate; };
 
-layout(binding = 0) uniform UniformBufferObject {
-    vec2 viewport_size;
-} ubo;
-
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec4 a_col;
 layout(location = 2) in vec2 a_uv;

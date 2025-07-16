@@ -86,23 +86,81 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.root_module.addImport("vulkan", vkzig_bindings);
 
     { // Shaders
-        const shadderc = b.option(bool, "shaderC", "Compile shaders") orelse false;
+        const glslc = b.option(bool, "glslc", "Compile glsl shaders") orelse false;
+        const slangc = b.option(bool, "slangc", "Compile slang shaders") orelse false;
+        _ = slangc; // autofix
+
         const shader_subpath = "shaders";
         const dir = std.fs.cwd().openDir(shader_subpath, .{ .iterate = true }) catch unreachable;
         var it = dir.iterate();
         while (it.next() catch unreachable) |f| {
             if (f.kind == .file) {
-                const is_shader_src =
+                const is_glsl =
                     std.mem.endsWith(u8, f.name, ".vert") or
                     std.mem.endsWith(u8, f.name, ".frag") or
                     std.mem.endsWith(u8, f.name, ".tesc") or
                     std.mem.endsWith(u8, f.name, ".tese") or
                     std.mem.endsWith(u8, f.name, ".geom") or
                     std.mem.endsWith(u8, f.name, ".comp");
-                if (is_shader_src) {
+                const is_slang = std.mem.endsWith(u8, f.name, ".slang");
+
+                if (is_slang and !glslc) {
+                    const shader_path = b.pathJoin(&.{ shader_subpath, f.name });
+                    const ShaderType = enum { vertex, fragment, compute };
+                    _ = ShaderType; // autofix
+                    const file_contents = std.fs.cwd().readFileAlloc(b.allocator, shader_path, 10 * 1024 * 1024) catch unreachable;
+                    defer b.allocator.free(file_contents);
+                    const shader_types: []const []const u8 = &.{ "[shader(\"vertex\")]", "[shader(\"fragment\")]" };
+                    for (shader_types, 0..) |_, shader_type_idx| {
+                        if (std.mem.indexOfAnyPos(u8, file_contents, 0, shader_types[shader_type_idx])) |_| {
+                            const out_name = std.mem.join(b.allocator, "", &.{
+                                f.name[0 .. f.name.len - ".slang".len],
+                                switch (shader_type_idx) {
+                                    0 => ".vert",
+                                    1 => ".frag",
+                                    else => unreachable,
+                                },
+                                ".spv",
+                            }) catch unreachable;
+                            const out_path = b.pathJoin(&.{ shader_subpath, out_name });
+                            const compile = b.addSystemCommand(&.{
+                                "slangc",
+                                "-target",
+                                "spirv",
+                                "-entry",
+                                switch (shader_type_idx) {
+                                    0 => "vertexMain",
+                                    1 => "fragmentMain",
+                                    else => unreachable,
+                                },
+                                "-o",
+                            });
+                            compile.addArg(out_name); // output file
+                            compile.addArg(f.name); // input file
+
+                            compile.setCwd(b.path(shader_subpath));
+
+                            const gf = b.allocator.create(std.Build.GeneratedFile) catch unreachable;
+                            gf.* = std.Build.GeneratedFile{ .step = &compile.step, .path = out_path };
+                            const out = std.Build.LazyPath{ .generated = .{ .file = gf } };
+                            exe.root_module.addAnonymousImport(out_name, .{
+                                .root_source_file = out,
+                            });
+                            exe_unit_tests.root_module.addAnonymousImport(out_name, .{
+                                .root_source_file = out,
+                            });
+                            exe.step.dependOn(&compile.step);
+                            //exe.step.dependOn(&b.addInstallFile(out, b.pathJoin(&.{ "shaders", out_name })).step);
+                        }
+                    }
+                }
+
+                if (is_glsl) {
                     const out_name = std.mem.join(b.allocator, "", &.{ f.name, ".spv" }) catch unreachable;
                     const out_path = b.pathJoin(&.{ shader_subpath, out_name });
-                    const out = if (shadderc) blk: {
+                    const out = blk: {
+                        if (!glslc) break :blk b.path(out_path); // compilation not requested, just point to output
+
                         const compile = b.addSystemCommand(&.{
                             "glslc",
                             "--target-env=vulkan1.2",
@@ -115,8 +173,7 @@ pub fn build(b: *std.Build) void {
                         const gf = b.allocator.create(std.Build.GeneratedFile) catch unreachable;
                         gf.* = std.Build.GeneratedFile{ .step = &compile.step, .path = out_path };
                         break :blk std.Build.LazyPath{ .generated = .{ .file = gf } };
-                    } else b.path(out_path);
-
+                    };
                     exe.root_module.addAnonymousImport(out_name, .{
                         .root_source_file = out,
                     });
