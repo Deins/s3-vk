@@ -136,6 +136,7 @@ pub fn build(b: *std.Build) void {
                                 "-o",
                             });
                             compile.addArg(out_name); // output file
+                            if (optimize == .Debug) compile.addArg("-minimum-slang-optimization") else compile.addArg("-O3");
                             compile.addArg(f.name); // input file
 
                             compile.setCwd(b.path(shader_subpath));
