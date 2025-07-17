@@ -14,9 +14,29 @@ const BaseBackend = dvui.backend;
 const DvuiVkRenderer = @import("dvui_vulkan_renderer.zig");
 
 const sdl = BaseBackend.c;
-const sdl_vk = @cImport({
+const import_sdl_vk = false;
+const sdl_vk = if (import_sdl_vk) @cImport({
     @cInclude("SDL3/SDL_vulkan.h");
-});
+}) else struct {
+    pub const SDL_FunctionPointer = ?*const fn () callconv(.c) void;
+    pub const struct_SDL_Window = opaque {};
+    pub const SDL_Window = struct_SDL_Window;
+
+    pub const struct_VkInstance_T = opaque {};
+    pub const _VkInstance = ?*struct_VkInstance_T;
+    pub const struct_VkPhysicalDevice_T = opaque {};
+    pub const VkPhysicalDevice = ?*struct_VkPhysicalDevice_T;
+    pub const struct_VkSurfaceKHR_T = opaque {};
+    pub const VkSurfaceKHR = ?*struct_VkSurfaceKHR_T;
+    pub const struct_VkAllocationCallbacks = opaque {};
+    pub extern fn SDL_Vulkan_LoadLibrary(path: [*c]const u8) bool;
+
+    pub extern fn SDL_Vulkan_GetInstanceExtensions(count: [*c]u32) [*c]const [*c]const u8;
+    pub extern fn SDL_Vulkan_GetVkGetInstanceProcAddr() SDL_FunctionPointer;
+    pub extern fn SDL_Vulkan_CreateSurface(window: ?*u64, instance: _VkInstance, allocator: ?*const struct_VkAllocationCallbacks, surface: [*c]VkSurfaceKHR) bool;
+    pub extern fn SDL_Vulkan_DestroySurface(instance: _VkInstance, surface: VkSurfaceKHR, allocator: ?*const struct_VkAllocationCallbacks) void;
+    pub extern fn SDL_Vulkan_GetPresentationSupport(instance: _VkInstance, physicalDevice: VkPhysicalDevice, queueFamilyIndex: u32) bool;
+};
 
 var sleep_when_inactive = false; // stop rendering when there are no visual changes
 
@@ -93,7 +113,7 @@ pub fn main() !void {
     defer VkInstance.deinit(vk_instance);
 
     var vk_surface: vk.SurfaceKHR = vk.SurfaceKHR.null_handle;
-    if (!sdl_vk.SDL_Vulkan_CreateSurface(@ptrCast(sdl_win), @ptrFromInt(@intFromEnum(vk_instance.handle)), null, @ptrCast(&vk_surface))) return errorSDL("Failed to create vulkan surface");
+    if (!sdl_vk.SDL_Vulkan_CreateSurface(@alignCast(@ptrCast(sdl_win)), @ptrFromInt(@intFromEnum(vk_instance.handle)), null, @ptrCast(&vk_surface))) return errorSDL("Failed to create vulkan surface");
     defer sdl_vk.SDL_Vulkan_DestroySurface(@ptrFromInt(@intFromEnum(vk_instance.handle)), @ptrFromInt(@intFromEnum(vk_surface)), null);
 
     var ctx = try VkContext.init(alloc, .{
