@@ -36,10 +36,6 @@ VSOutput vertexMain(VSInput input)
     return output;
 }
 
-//
-// Fragment shader
-//
-
 [shader("fragment")]
 float4 fragmentMain(VSOutput input)
 {

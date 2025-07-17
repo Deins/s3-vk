@@ -86,9 +86,14 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.root_module.addImport("vulkan", vkzig_bindings);
 
     { // Shaders
+        const Shader = struct {
+            name: []const u8,
+            path: std.Build.LazyPath,
+            step: ?*std.Build.Step = null,
+        };
+        var shaders = std.ArrayList(Shader).init(b.allocator);
         const glslc = b.option(bool, "glslc", "Compile glsl shaders") orelse false;
         const slangc = b.option(bool, "slangc", "Compile slang shaders") orelse false;
-        _ = slangc; // autofix
 
         const shader_subpath = "shaders";
         const dir = std.fs.cwd().openDir(shader_subpath, .{ .iterate = true }) catch unreachable;
@@ -123,44 +128,40 @@ pub fn build(b: *std.Build) void {
                                 ".spv",
                             }) catch unreachable;
                             const out_path = b.pathJoin(&.{ shader_subpath, out_name });
-                            const compile = b.addSystemCommand(&.{
-                                "slangc",
-                                "-target",
-                                "spirv",
-                                "-entry",
-                                switch (shader_type_idx) {
-                                    0 => "vertexMain",
-                                    1 => "fragmentMain",
-                                    else => unreachable,
-                                },
-                                "-o",
-                            });
-                            compile.addArg(out_name); // output file
-                            if (optimize == .Debug) compile.addArg("-minimum-slang-optimization") else compile.addArg("-O3");
-                            compile.addArg(f.name); // input file
+                            if (!slangc) {
+                                shaders.append(.{ .name = out_name, .path = b.path(out_path) }) catch @panic("OOM"); // compilation not requested, just point to output
+                            } else {
+                                const compile = b.addSystemCommand(&.{
+                                    "slangc",
+                                    "-target",
+                                    "spirv",
+                                    "-entry",
+                                    switch (shader_type_idx) {
+                                        0 => "vertexMain",
+                                        1 => "fragmentMain",
+                                        else => unreachable,
+                                    },
+                                    "-o",
+                                });
+                                compile.addArg(out_name); // output file
+                                if (optimize == .Debug) compile.addArg("-minimum-slang-optimization") else compile.addArg("-O3");
+                                compile.addArg(f.name); // input file
 
-                            compile.setCwd(b.path(shader_subpath));
+                                compile.setCwd(b.path(shader_subpath));
 
-                            const gf = b.allocator.create(std.Build.GeneratedFile) catch unreachable;
-                            gf.* = std.Build.GeneratedFile{ .step = &compile.step, .path = out_path };
-                            const out = std.Build.LazyPath{ .generated = .{ .file = gf } };
-                            exe.root_module.addAnonymousImport(out_name, .{
-                                .root_source_file = out,
-                            });
-                            exe_unit_tests.root_module.addAnonymousImport(out_name, .{
-                                .root_source_file = out,
-                            });
-                            exe.step.dependOn(&compile.step);
-                            //exe.step.dependOn(&b.addInstallFile(out, b.pathJoin(&.{ "shaders", out_name })).step);
+                                const gf = b.allocator.create(std.Build.GeneratedFile) catch unreachable;
+                                gf.* = std.Build.GeneratedFile{ .step = &compile.step, .path = out_path };
+                                shaders.append(Shader{ .name = out_name, .path = std.Build.LazyPath{ .generated = .{ .file = gf } } }) catch @panic("OOM");
+                            }
                         }
                     }
                 }
 
-                if (is_glsl) {
+                if (is_glsl and !slangc) {
                     const out_name = std.mem.join(b.allocator, "", &.{ f.name, ".spv" }) catch unreachable;
                     const out_path = b.pathJoin(&.{ shader_subpath, out_name });
-                    const out = blk: {
-                        if (!glslc) break :blk b.path(out_path); // compilation not requested, just point to output
+                    shaders.append(blk: {
+                        if (!glslc) break :blk Shader{ .name = out_name, .path = b.path(out_path) }; // compilation not requested, just point to output
 
                         const compile = b.addSystemCommand(&.{
                             "glslc",
@@ -173,17 +174,22 @@ pub fn build(b: *std.Build) void {
 
                         const gf = b.allocator.create(std.Build.GeneratedFile) catch unreachable;
                         gf.* = std.Build.GeneratedFile{ .step = &compile.step, .path = out_path };
-                        break :blk std.Build.LazyPath{ .generated = .{ .file = gf } };
-                    };
-                    exe.root_module.addAnonymousImport(out_name, .{
-                        .root_source_file = out,
-                    });
-                    exe_unit_tests.root_module.addAnonymousImport(out_name, .{
-                        .root_source_file = out,
-                    });
-                    //exe.step.dependOn(&b.addInstallFile(out, b.pathJoin(&.{ "shaders", out_name })).step);
+                        break :blk Shader{ .name = out_name, .path = std.Build.LazyPath{ .generated = .{ .file = gf } } };
+                    }) catch @panic("OOM");
                 }
             }
+        }
+
+        // add shader modules
+        for (shaders.items) |shader| {
+            exe.root_module.addAnonymousImport(shader.name, .{
+                .root_source_file = shader.path,
+            });
+            exe_unit_tests.root_module.addAnonymousImport(shader.name, .{
+                .root_source_file = shader.path,
+            });
+            if (shader.step) |step| exe.step.dependOn(step);
+            if (shader.step) |step| exe_unit_tests.step.dependOn(step);
         }
     }
 }
