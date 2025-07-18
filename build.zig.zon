@@ -31,8 +31,8 @@
         },
         .vulkan_zig = .{
             //.path = "deps/vulkan-zig",
-            .url = "git+https://github.com/Snektron/vulkan-zig.git#dcd538828c513919c3abf0bd55afacdce0576c61",
-            .hash = "vulkan-0.0.0-r7Ytxy5bAwASnqFlLMD4V42z3LolS8n7xv3RlbXhAhv0",
+            .url = "git+https://github.com/Snektron/vulkan-zig.git#c66bddee009a8c4b71082ab7af723ed885161650",
+            .hash = "vulkan-0.0.0-r7YtxwZVAwDbCFXX5GpnS436SfBec9INY0zq-2OQ2BUp",
         },
     },
     .paths = .{

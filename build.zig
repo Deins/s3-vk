@@ -13,17 +13,17 @@ pub fn build(b: *std.Build) void {
 
     const dvui_dep = b.dependency("dvui", .{ .backend = .sdl3, .target = target, .optimize = optimize });
 
-    const lib = b.addStaticLibrary(.{
-        .name = "s3-vk",
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    b.installArtifact(lib);
+    // const lib = b.addStaticLibrary(.{
+    //     .name = "s3-vk",
+    //     .root_source_file = b.path("src/root.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
+    // b.installArtifact(lib);
 
     const exe = b.addExecutable(.{
         .name = "s3-vk",
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/triangle_main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -65,8 +65,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
 
     // SDL
-    exe.addIncludePath(b.path("deps/SDL/include"));
-    exe_unit_tests.addIncludePath(b.path("deps/SDL/include"));
+    // exe.addIncludePath(b.path("deps/SDL/include"));
+    // exe_unit_tests.addIncludePath(b.path("deps/SDL/include"));
 
     // Vulkan
     const vk_registry_opt = b.option([]const u8, "vk_registry", "Path to vulkan registry vk.xml");

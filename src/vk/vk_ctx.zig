@@ -6,14 +6,13 @@ const std = @import("std");
 const vk = @import("vulkan");
 const slog = std.log.scoped(.vk_ctx);
 const vk_instance = @import("vk_instance.zig");
-const apis = vk_instance.apis;
 
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
 pub const VkContext = struct {
-    pub const DeviceProxy = vk.DeviceProxy(apis);
-    pub const CommandBuffer = vk.CommandBufferProxy(apis);
-    pub const QueueProxy = vk.QueueProxy(apis);
+    pub const DeviceProxy = vk.DeviceProxy;
+    pub const CommandBuffer = vk.CommandBufferProxy;
+    pub const QueueProxy = vk.QueueProxy;
 
     // const max_queues = 6;
     // const QueueStrategy = {
@@ -24,7 +23,7 @@ pub const VkContext = struct {
     // const Queues = union(QueueStrategy) {};
 
     pub const Options = struct {
-        instance: vk_instance.InstanceProxy,
+        instance: vk.InstanceProxy,
         surface: vk.SurfaceKHR = vk.SurfaceKHR.null_handle,
         selected_device: ?u32 = null, // which gpu device to use
         vk_alloc: ?*vk.AllocationCallbacks = null, // host side vulkan allocator
@@ -36,7 +35,7 @@ pub const VkContext = struct {
 
     alloc: std.mem.Allocator,
     vk_alloc: ?*vk.AllocationCallbacks,
-    instance: vk_instance.InstanceProxy,
+    instance: vk.InstanceProxy,
     dev: DeviceProxy,
     pdev: vk.PhysicalDevice,
     surface: vk.SurfaceKHR,
@@ -117,9 +116,11 @@ pub const VkContext = struct {
             .enabled_extension_count = required_device_extensions.len,
             .pp_enabled_extension_names = @ptrCast(&required_device_extensions[0]),
         }, null);
-        const dev_wrapper = try alloc.create(vk.DeviceWrapper(apis));
-        dev_wrapper.* = try vk.DeviceWrapper(apis).load(dev_handle, vki.wrapper.dispatch.vkGetDeviceProcAddr); // instance_dispatch.dispatch.vkGetDeviceProcAddr
-        const dev = vk.DeviceProxy(apis).init(dev_handle, dev_wrapper);
+        const dev_wrapper = try alloc.create(vk.DeviceWrapper);
+        if (vki.wrapper.dispatch.vkGetDeviceProcAddr) |vkGetProcAddr| {
+            dev_wrapper.* = vk.DeviceWrapper.load(dev_handle, vkGetProcAddr); // instance_dispatch.dispatch.vkGetDeviceProcAddr
+        } else @panic("Failed to load vkGetDeviceProcAddr");
+        const dev = vk.DeviceProxy.init(dev_handle, dev_wrapper);
         errdefer dev.destroyDevice(vk_alloc); // todo: this should be done earlier to not leak it in case of proxy/loader failure?
 
         const main_queue = dev.getDeviceQueue(@intCast(main_queue_idx), 0);

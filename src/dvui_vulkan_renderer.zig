@@ -28,8 +28,7 @@ const fs_spv align(64) = @embedFile("dvui.frag.spv").*;
 
 const Self = @This();
 
-pub const apis: []const vk.ApiInfo = &(.{vk.features.version_1_0});
-pub const DeviceProxy = vk.DeviceProxy(apis);
+pub const DeviceProxy = vk.DeviceProxy;
 pub const Vertex = dvui.Vertex;
 pub const Indice = u16;
 pub const invalid_texture: *anyopaque = @ptrFromInt(0xBAD0BAD0); //@ptrFromInt(0xFFFF_FFFF);
@@ -118,7 +117,7 @@ pub const Stats = struct {
 };
 
 // we need stable pointer to this, but its not worth allocating it, so make it global
-var g_dev_wrapper: vk.DeviceWrapper(apis) = undefined;
+var g_dev_wrapper: vk.DeviceWrapper = undefined;
 
 base_backend: *dvui.backend,
 
@@ -219,8 +218,8 @@ const FrameData = struct {
 pub fn init(alloc: std.mem.Allocator, base_backend: *dvui.backend, opt: InitOptions) !Self {
     // TODO: FIXME: in multiple places here in this function we will leak if error gets thrown
     const dev_handle = opt.dev;
-    g_dev_wrapper = try vk.DeviceWrapper(apis).load(dev_handle, opt.vkGetDeviceProcAddr);
-    var dev = vk.DeviceProxy(apis).init(dev_handle, &g_dev_wrapper);
+    g_dev_wrapper = vk.DeviceWrapper.load(dev_handle, opt.vkGetDeviceProcAddr);
+    var dev = vk.DeviceProxy.init(dev_handle, &g_dev_wrapper);
 
     // Memory
     // host visible

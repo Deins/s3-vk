@@ -204,7 +204,7 @@ pub fn main() !void {
     errdefer base_backend.deinit();
     var dvui_vk_backend = try DvuiVkRenderer.init(alloc, &base_backend, .{
         .max_frames_in_flight = max_frames_in_flight,
-        .vkGetDeviceProcAddr = ctx.instance.wrapper.dispatch.vkGetDeviceProcAddr,
+        .vkGetDeviceProcAddr = ctx.instance.wrapper.dispatch.vkGetDeviceProcAddr.?,
         .dev = ctx.dev.handle,
         .pdev = ctx.pdev,
         .render_pass = render_pass,
